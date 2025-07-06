@@ -1,0 +1,493 @@
+openapi: 3.1.0
+info:
+  title: 大容量ファイル分割アップロードAPI
+  description: |
+    チャンク分割による大容量ファイルアップロードシステム
+    - セッション管理
+    - チャンク完全性検証
+    - 進捗確認
+    - 再開可能なアップロード
+  version: "1.0.0"
+  contact:
+    name: 開発チーム
+servers:
+  - url: http://192.168.0.16:8080
+    description: 開発環境
+
+paths:
+  /upload/session:
+    post:
+      summary: アップロードセッション作成
+      description: |
+        新しいファイルアップロードセッションを作成します。
+        ファイル名、総チャンク数、ファイル全体のチェックサムを指定します。
+      operationId: createUploadSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+            examples:
+              example1:
+                summary: 基本的な例
+                value:
+                  fileName: "sample-video.mp4"
+                  totalChunks: 100
+                  fileSize: 104857600
+                  fileChecksum: "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
+                  chunkSize: 1048576
+      responses:
+        '201':
+          description: セッション作成成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionResponse'
+              examples:
+                example1:
+                  summary: 作成成功
+                  value:
+                    sessionId: "session_123456789"
+                    status: "created"
+                    message: "アップロードセッションが作成されました"
+        '400':
+          description: 無効なリクエスト
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: サーバーエラー
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /upload/session/{sessionId}/chunk/{chunkIndex}:
+    put:
+      summary: チャンクアップロード
+      description: |
+        指定されたセッションにファイルチャンクをアップロードします。
+        チャンクはバイナリデータとして送信され、整合性はSHA256で検証されます。
+      operationId: uploadChunk
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          description: セッションID
+          schema:
+            type: string
+            example: "session_123456789"
+        - name: chunkIndex
+          in: path
+          required: true
+          description: チャンクインデックス（0から開始）
+          schema:
+            type: integer
+            minimum: 0
+            example: 0
+        - name: X-Chunk-Checksum
+          in: header
+          required: true
+          description: チャンクのSHA256ハッシュ
+          schema:
+            type: string
+            example: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              description: チャンクのバイナリデータ
+      responses:
+        '200':
+          description: チャンクアップロード成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChunkUploadResponse'
+              examples:
+                example1:
+                  summary: アップロード成功
+                  value:
+                    chunkIndex: 0
+                    status: "uploaded"
+                    message: "チャンクが正常にアップロードされました"
+        '400':
+          description: 無効なリクエスト（チェックサム不一致含む）
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: セッションが見つからない
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: チャンクが既に存在する
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: サーバーエラー
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /upload/session/{sessionId}/status:
+    get:
+      summary: アップロードステータス確認
+      description: |
+        指定されたセッションのアップロードステータスを確認します。
+        欠けているチャンクの一覧を返します。
+      operationId: getUploadStatus
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          description: セッションID
+          schema:
+            type: string
+            example: "session_123456789"
+      responses:
+        '200':
+          description: ステータス取得成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+              examples:
+                incomplete:
+                  summary: アップロード未完了
+                  value:
+                    sessionId: "session_123456789"
+                    status: "uploading"
+                    totalChunks: 100
+                    uploadedChunks: 75
+                    missingChunks: [10, 15, 23, 34, 45, 56, 67, 78, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99]
+                    progress: 0.75
+                complete:
+                  summary: アップロード完了
+                  value:
+                    sessionId: "session_123456789"
+                    status: "ready"
+                    totalChunks: 100
+                    uploadedChunks: 100
+                    missingChunks: []
+                    progress: 1.0
+        '404':
+          description: セッションが見つからない
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: サーバーエラー
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /upload/session/{sessionId}/complete:
+    post:
+      summary: アップロード完了通知
+      description: |
+        全てのチャンクがアップロード完了したことをサーバーに通知し、
+        ファイルの結合と最終検証を実行します。
+      operationId: completeUpload
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          description: セッションID
+          schema:
+            type: string
+            example: "session_123456789"
+      responses:
+        '200':
+          description: アップロード完了成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CompleteResponse'
+              examples:
+                example1:
+                  summary: 完了成功
+                  value:
+                    sessionId: "session_123456789"
+                    status: "completed"
+                    finalFileChecksum: "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
+                    filePath: "/uploads/session_123456789/sample-video.mp4"
+                    message: "ファイルのアップロードが完了しました"
+        '400':
+          description: アップロードが未完了
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: セッションが見つからない
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '422':
+          description: ファイル整合性チェック失敗
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: サーバーエラー
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /upload/session/{sessionId}:
+    delete:
+      summary: アップロードセッション削除
+      description: |
+        指定されたセッションとアップロード済みのチャンクを削除します。
+      operationId: deleteUploadSession
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          description: セッションID
+          schema:
+            type: string
+            example: "session_123456789"
+      responses:
+        '200':
+          description: セッション削除成功
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteResponse'
+        '404':
+          description: セッションが見つからない
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '500':
+          description: サーバーエラー
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    CreateSessionRequest:
+      type: object
+      required:
+        - fileName
+        - totalChunks
+        - fileSize
+        - fileChecksum
+        - chunkSize
+      properties:
+        fileName:
+          type: string
+          description: アップロードするファイル名
+          example: "sample-video.mp4"
+          maxLength: 255
+        totalChunks:
+          type: integer
+          description: 総チャンク数
+          minimum: 1
+          maximum: 10000
+          example: 100
+        fileSize:
+          type: integer
+          description: ファイルサイズ（バイト）
+          minimum: 1
+          example: 104857600
+        fileChecksum:
+          type: string
+          description: ファイル全体のSHA256ハッシュ
+          pattern: "^[a-f0-9]{64}$"
+          example: "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
+        chunkSize:
+          type: integer
+          description: チャンクサイズ（バイト）
+          minimum: 1024
+          maximum: 10485760
+          example: 1048576
+
+    SessionResponse:
+      type: object
+      required:
+        - sessionId
+        - status
+        - message
+      properties:
+        sessionId:
+          type: string
+          description: 生成されたセッションID
+          example: "session_123456789"
+        status:
+          type: string
+          enum: [created]
+          description: セッションステータス
+          example: "created"
+        message:
+          type: string
+          description: レスポンスメッセージ
+          example: "アップロードセッションが作成されました"
+
+    ChunkUploadResponse:
+      type: object
+      required:
+        - chunkIndex
+        - status
+        - message
+      properties:
+        chunkIndex:
+          type: integer
+          description: アップロードされたチャンクのインデックス
+          example: 0
+        status:
+          type: string
+          enum: [uploaded]
+          description: チャンクアップロードステータス
+          example: "uploaded"
+        message:
+          type: string
+          description: レスポンスメッセージ
+          example: "チャンクが正常にアップロードされました"
+
+    StatusResponse:
+      type: object
+      required:
+        - sessionId
+        - status
+        - totalChunks
+        - uploadedChunks
+        - missingChunks
+        - progress
+      properties:
+        sessionId:
+          type: string
+          description: セッションID
+          example: "session_123456789"
+        status:
+          type: string
+          enum: [uploading, ready, completed, error]
+          description: |
+            アップロードステータス
+            - uploading: アップロード中
+            - ready: 全チャンクアップロード完了、結合待ち
+            - completed: ファイル結合完了
+            - error: エラー状態
+          example: "uploading"
+        totalChunks:
+          type: integer
+          description: 総チャンク数
+          example: 100
+        uploadedChunks:
+          type: integer
+          description: アップロード済みチャンク数
+          example: 75
+        missingChunks:
+          type: array
+          items:
+            type: integer
+          description: 未アップロードのチャンクインデックス一覧
+          example: [10, 15, 23]
+        progress:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: アップロード進捗（0.0〜1.0）
+          example: 0.75
+
+    CompleteResponse:
+      type: object
+      required:
+        - sessionId
+        - status
+        - finalFileChecksum
+        - filePath
+        - message
+      properties:
+        sessionId:
+          type: string
+          description: セッションID
+          example: "session_123456789"
+        status:
+          type: string
+          enum: [completed]
+          description: 完了ステータス
+          example: "completed"
+        finalFileChecksum:
+          type: string
+          description: 結合後ファイルのSHA256ハッシュ
+          pattern: "^[a-f0-9]{64}$"
+          example: "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
+        filePath:
+          type: string
+          description: 保存されたファイルのパス
+          example: "/uploads/session_123456789/sample-video.mp4"
+        message:
+          type: string
+          description: レスポンスメッセージ
+          example: "ファイルのアップロードが完了しました"
+
+    DeleteResponse:
+      type: object
+      required:
+        - sessionId
+        - status
+        - message
+      properties:
+        sessionId:
+          type: string
+          description: 削除されたセッションID
+          example: "session_123456789"
+        status:
+          type: string
+          enum: [deleted]
+          description: 削除ステータス
+          example: "deleted"
+        message:
+          type: string
+          description: レスポンスメッセージ
+          example: "セッションが削除されました"
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+          description: エラーコード
+          example: "INVALID_CHECKSUM"
+        message:
+          type: string
+          description: エラーメッセージ
+          example: "チェックサムが一致しません"
+        details:
+          type: string
+          description: 詳細なエラー情報
+          example: "期待値: abc123..., 実際の値: def456..."
+
+  securitySchemes: {}
+
+security: []
+
+tags:
+  - name: Upload
+    description: ファイルアップロード関連API

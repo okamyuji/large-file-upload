@@ -1,0 +1,334 @@
+# =============================================================================
+# Large File Upload System .gitignore
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Server/Go Related
+# -----------------------------------------------------------------------------
+
+# Go binaries
+server/server
+server/main
+server/*.exe
+server/*.exe~
+server/*.dll
+server/*.so
+server/*.dylib
+
+# Go test binaries
+server/*.test
+
+# Go coverage files
+server/*.out
+server/coverage.html
+
+# Go vendor directory
+server/vendor/
+
+# Go module download cache
+server/go.sum
+
+# Air (Go hot reload) temporary files
+server/tmp/
+server/.air.toml
+
+# -----------------------------------------------------------------------------
+# Uploaded Files (Project Specific)
+# -----------------------------------------------------------------------------
+
+# Uploaded files directory - IMPORTANT: Keep out of version control
+server/uploads/
+# But keep the directory structure
+!server/uploads/.gitkeep
+
+# Temporary upload files
+server/temp/
+server/tmp/
+*.tmp
+*.temp
+
+# -----------------------------------------------------------------------------
+# Client/iOS/Swift Related
+# -----------------------------------------------------------------------------
+
+# Xcode
+client/*.xcodeproj/*
+!client/*.xcodeproj/project.pbxproj
+!client/*.xcodeproj/xcshareddata/
+!client/*.xcodeproj/project.xcworkspace/
+client/*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Xcode User Data
+client/*.xcuserstate
+client/xcuserdata/
+client/*.xcuserdatad/
+
+# iOS Build
+client/DerivedData/
+client/build/
+client/Build/
+
+# iOS Archives
+client/*.xcarchive
+
+# CocoaPods
+client/Pods/
+client/Podfile.lock
+
+# Swift Package Manager
+client/.swiftpm/
+client/Package.resolved
+
+# Carthage
+client/Carthage/
+
+# fastlane
+client/fastlane/report.xml
+client/fastlane/Preview.html
+client/fastlane/screenshots/**/*.png
+client/fastlane/test_output
+
+# iOS Provisioning
+client/*.mobileprovision
+client/*.cer
+client/*.p12
+client/*.dSYM.zip
+client/*.dSYM
+
+# -----------------------------------------------------------------------------
+# Development Environment
+# -----------------------------------------------------------------------------
+
+# Visual Studio Code
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.iws
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+
+# -----------------------------------------------------------------------------
+# Operating System
+# -----------------------------------------------------------------------------
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# -----------------------------------------------------------------------------
+# Logs and Databases
+# -----------------------------------------------------------------------------
+
+# Log files
+*.log
+logs/
+*.log.*
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Redis dump
+dump.rdb
+
+# -----------------------------------------------------------------------------
+# Configuration and Secrets
+# -----------------------------------------------------------------------------
+
+# Environment variables
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Configuration files with secrets
+config/secrets.yaml
+config/local.yaml
+*.pem
+*.key
+*.crt
+
+# -----------------------------------------------------------------------------
+# Testing and Coverage
+# -----------------------------------------------------------------------------
+
+# Test coverage
+coverage/
+*.cover
+*.coverage
+.coverage
+.coverage.*
+coverage.xml
+*.lcov
+
+# Test results
+test-results/
+test-output/
+.nyc_output/
+
+# -----------------------------------------------------------------------------
+# Documentation
+# -----------------------------------------------------------------------------
+
+# Generated documentation
+docs/_build/
+docs/html/
+site/
+
+# -----------------------------------------------------------------------------
+# Dependencies and Package Managers
+# -----------------------------------------------------------------------------
+
+# Node.js (if used for build tools)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# Python (if used for scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# -----------------------------------------------------------------------------
+# Build Artifacts and Distributions
+# -----------------------------------------------------------------------------
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Compiled Object files
+*.o
+*.a
+*.so
+*.dylib
+
+# -----------------------------------------------------------------------------
+# Temporary Files
+# -----------------------------------------------------------------------------
+
+# Temporary directories
+tmp/
+temp/
+.tmp/
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+
+# Archive files (unless specifically needed)
+*.zip
+*.tar.gz
+*.tgz
+*.tar
+*.rar
+*.7z
+
+# -----------------------------------------------------------------------------
+# Performance and Profiling
+# -----------------------------------------------------------------------------
+
+# Profiling data
+*.prof
+*.pprof
+*.trace
+
+# Performance monitoring
+*.perf
+
+# -----------------------------------------------------------------------------
+# Docker (if used)
+# -----------------------------------------------------------------------------
+
+# Docker override files
+docker-compose.override.yml
+.dockerignore
+
+# -----------------------------------------------------------------------------
+# CI/CD
+# -----------------------------------------------------------------------------
+
+# GitHub Actions artifacts
+.github/workflows/*.yml.bak
+
+# GitLab CI
+.gitlab-ci.local.yml
+
+# -----------------------------------------------------------------------------
+# Custom Project Files
+# -----------------------------------------------------------------------------
+
+# Development notes
+NOTES.md
+TODO.md
+.notes/
+
+# Local development scripts
+scripts/local/
+local/
+
+# Experimental features
+experimental/
+sandbox/
+
+# =============================================================================
+# End of .gitignore
+# =============================================================================
