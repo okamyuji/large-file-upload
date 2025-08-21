@@ -97,7 +97,7 @@ large-file-upload/
 
 ```bash
 # 既にディレクトリが存在する場合
-cd /Users/yujiokamoto/devs/swift/large-file-upload
+cd large-file-upload
 
 # 開発環境セットアップ
 make setup-dev
@@ -117,11 +117,28 @@ make build-server
 ### 3. クライアント起動
 
 ```bash
-# Xcodeでプロジェクトを開く
-open client/LargeFileUpload.xcodeproj
+# シミュレーター実行（例：iPhone 16 Pro/iOS 18.2）
+# Debugビルド
+cd client && xcodebuild -scheme LargeFileUpload -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=18.2' build
 
-# またはコマンドラインビルド
-make build-client
+# Releaseビルド
+cd client && xcodebuild -scheme LargeFileUpload -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=18.2' -configuration Release build
+
+# Releaseアプリをシミュレーターで起動
+cd client && xcrun simctl install booted ~/Library/Developer/Xcode/DerivedData/LargeFileUpload-*/Build/Products/Release-iphonesimulator/LargeFileUpload.app && xcrun simctl launch booted com.okamyuji.fileupload.LargeFileUpload
+
+# 実機実行
+# 接続された実機一覧確認
+xcrun devicectl list devices
+
+# 実機でビルド（UDIDを指定）
+cd client && xcodebuild -scheme LargeFileUpload -destination 'platform=iOS,id=YOUR_DEVICE_UDID' build
+
+# 実機にインストール（要Developer Certificate）
+cd client && xcodebuild -scheme LargeFileUpload -destination 'platform=iOS,id=YOUR_DEVICE_UDID' -configuration Release install
+
+# Xcode GUI
+open client/LargeFileUpload.xcodeproj
 ```
 
 ### 4. Dockerでの起動（推奨）

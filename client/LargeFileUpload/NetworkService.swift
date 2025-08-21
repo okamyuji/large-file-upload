@@ -149,6 +149,10 @@ class NetworkService: NSObject, ObservableObject {
     @objc private func appDidEnterBackground() {
         isAppInBackground = true
         print("🌙 バックグラウンド移行 - MainActor使用停止、逐次アップロード継続")
+        
+        // バックグラウンドでは過度な監視を停止してiOSに任せる
+        stopTaskMonitoring()
+        print("🛑 [BACKGROUND] タスク監視を停止 - 30秒後はiOSが管理")
     }
 
     @objc private func appWillEnterForeground() {
@@ -344,8 +348,10 @@ class NetworkService: NSObject, ObservableObject {
                 }
             }
             
-            // タスク監視タイマーを開始（初回のみ）
-            startTaskMonitoringIfNeeded()
+            // バックグラウンドではタスク監視不要 - iOSに任せる
+            if !isAppInBackground {
+                startTaskMonitoringIfNeeded()
+            }
             
         } catch {
             uploadQueues[session.id]?.setProcessing(false)
