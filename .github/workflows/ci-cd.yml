@@ -30,7 +30,7 @@ jobs:
         go-version: ${{ env.GO_VERSION }}
     
     - name: Cache Go modules
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: |
           ~/.cache/go-build
@@ -65,7 +65,7 @@ jobs:
       run: go build -v -o server main.go
     
     - name: Upload server binary
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: server-binary
         path: ./server/server
@@ -87,7 +87,7 @@ jobs:
       run: sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer
     
     - name: Cache Xcode DerivedData
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/Library/Developer/Xcode/DerivedData
         key: ${{ runner.os }}-xcode-derived-data-${{ hashFiles('**/*.xcodeproj/**') }}
@@ -104,7 +104,7 @@ jobs:
           clean test
     
     - name: Upload test results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: ios-test-results
@@ -122,7 +122,7 @@ jobs:
     
     - name: Upload Archive
       if: github.ref == 'refs/heads/main'
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: ios-archive
         path: ./client/LargeFileUpload.xcarchive
@@ -156,7 +156,7 @@ jobs:
         npx redoc-cli build docs/openapi.yaml --output docs/api-documentation.html
     
     - name: Upload API documentation
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: api-documentation
         path: docs/api-documentation.html
@@ -304,7 +304,7 @@ jobs:
         TARGET_URL: ${{ secrets.PROD_URL }}
     
     - name: Upload performance results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: performance-results
