@@ -333,3 +333,6 @@ jobs:
         status: failure
         text: 'Some tests failed! ❌'
         webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+
+  security:
+    uses: okamyuji/reusable-workflows/.github/workflows/security-scan.yml@v1
