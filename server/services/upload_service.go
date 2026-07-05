@@ -73,7 +73,7 @@ func (s *UploadService) GetSession(sessionID string) (*models.UploadSession, boo
 	return session, exists
 }
 
-// UploadChunk チャンクをアップロード
+// UploadChunk チャンクをアップロード（堅牢な並行性制御付き）
 func (s *UploadService) UploadChunk(sessionID string, chunkIndex int, chunkData []byte, expectedChecksum string) error {
 	// セッション取得
 	session, exists := s.GetSession(sessionID)
@@ -86,30 +86,66 @@ func (s *UploadService) UploadChunk(sessionID string, chunkIndex int, chunkData 
 		return fmt.Errorf("無効なチャンクインデックス: %d (範囲: 0-%d)", chunkIndex, session.TotalChunks-1)
 	}
 
-	// 既にアップロード済みかチェック
-	s.sessionsMux.RLock()
-	_, alreadyUploaded := session.UploadedChunks[chunkIndex]
-	s.sessionsMux.RUnlock()
-
-	if alreadyUploaded {
-		return fmt.Errorf("チャンク %d は既にアップロード済みです", chunkIndex)
-	}
-
-	// チェックサム検証
+	// チェックサム検証（早期検証でパフォーマンス向上）
 	actualChecksum := utils.CalculateChecksum(chunkData)
 	if actualChecksum != expectedChecksum {
 		return fmt.Errorf("チェックサム不一致 - 期待値: %s, 実際の値: %s", expectedChecksum, actualChecksum)
 	}
 
-	// チャンクファイル保存
+	// チャンクレベルのファイルロック取得（10秒タイムアウト）
+	chunkLock, err := utils.AcquireChunkLock(sessionID, chunkIndex, 10*time.Second)
+	if err != nil {
+		return fmt.Errorf("チャンクロック取得エラー: %w", err)
+	}
+	defer func() {
+		if releaseErr := chunkLock.Release(); releaseErr != nil {
+			log.Printf("⚠️ [SERVICE] チャンクロック解放エラー (session: %s, chunk: %d): %v", sessionID, chunkIndex, releaseErr)
+		}
+	}()
+
+	// 重複チェック（ロック内で再確認）
+	s.sessionsMux.RLock()
+	_, alreadyUploaded := session.UploadedChunks[chunkIndex]
+	s.sessionsMux.RUnlock()
+
+	if alreadyUploaded {
+		log.Printf("ℹ️ [SERVICE] チャンク %d は既にアップロード済み (session: %s)", chunkIndex, sessionID)
+		return fmt.Errorf("チャンク %d は既にアップロード済みです", chunkIndex)
+	}
+
+	// ファイルレベルでの存在確認（ファイルシステムレベルでの重複防止）
+	chunkExists, err := utils.CheckChunkExists(sessionID, chunkIndex)
+	if err != nil {
+		return fmt.Errorf("チャンクファイル存在確認エラー: %w", err)
+	}
+	if chunkExists {
+		log.Printf("ℹ️ [SERVICE] チャンクファイル %d が既に存在 (session: %s)", chunkIndex, sessionID)
+		// ファイルが存在するがメモリ上のセッション情報が不整合の場合、セッション情報を修復
+		chunkFileName := fmt.Sprintf("chunk_%d.dat", chunkIndex)
+		chunkFilePath := filepath.Join(session.WorkingDir, chunkFileName)
+		chunkInfo := models.ChunkInfo{
+			Index:     chunkIndex,
+			Size:      int64(len(chunkData)),
+			Checksum:  actualChecksum,
+			FilePath:  chunkFilePath,
+			CreatedAt: time.Now(),
+		}
+		s.sessionsMux.Lock()
+		session.UploadedChunks[chunkIndex] = chunkInfo
+		session.UpdateStatus()
+		s.sessionsMux.Unlock()
+		return fmt.Errorf("チャンク %d は既にアップロード済みです", chunkIndex)
+	}
+
+	// 原子的なチャンクファイル保存
 	chunkFileName := fmt.Sprintf("chunk_%d.dat", chunkIndex)
 	chunkFilePath := filepath.Join(session.WorkingDir, chunkFileName)
 
-	if err := s.saveChunkFile(chunkFilePath, chunkData); err != nil {
+	if err := utils.AtomicChunkWrite(chunkFilePath, chunkData); err != nil {
 		return fmt.Errorf("チャンクファイル保存エラー: %w", err)
 	}
 
-	// チャンク情報更新
+	// チャンク情報更新（セッションレベルロック）
 	chunkInfo := models.ChunkInfo{
 		Index:     chunkIndex,
 		Size:      int64(len(chunkData)),
@@ -121,8 +157,13 @@ func (s *UploadService) UploadChunk(sessionID string, chunkIndex int, chunkData 
 	s.sessionsMux.Lock()
 	session.UploadedChunks[chunkIndex] = chunkInfo
 	session.UpdateStatus()
-	log.Printf("✅ [SERVICE] Chunk %d uploaded for session %s. Total: %d/%d", chunkIndex, sessionID, len(session.UploadedChunks), session.TotalChunks)
+	uploadedCount := len(session.UploadedChunks)
+	totalChunks := session.TotalChunks
 	s.sessionsMux.Unlock()
+
+	log.Printf("✅ [SERVICE] Chunk %d uploaded for session %s. Total: %d/%d (%.1f%%)", 
+		chunkIndex, sessionID, uploadedCount, totalChunks, 
+		float64(uploadedCount)/float64(totalChunks)*100)
 
 	return nil
 }
@@ -263,17 +304,6 @@ func (s *UploadService) validateCreateSessionRequest(req *models.CreateSessionRe
 	return nil
 }
 
-// saveChunkFile チャンクファイルを保存
-func (s *UploadService) saveChunkFile(filePath string, data []byte) error {
-	file, err := os.Create(filePath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	_, err = file.Write(data)
-	return err
-}
 
 // cleanupChunkFiles チャンクファイルを削除（最終ファイルは残す）
 func (s *UploadService) cleanupChunkFiles(session *models.UploadSession) {

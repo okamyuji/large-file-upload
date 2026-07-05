@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"large-file-upload-server/models"
@@ -226,4 +228,129 @@ func EnableCORS(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
 	}
+}
+
+// ChunkLock チャンクレベルのロック管理
+type ChunkLock struct {
+	LockFile *os.File
+	FilePath string
+}
+
+// AcquireChunkLock チャンクの排他ロックを取得
+func AcquireChunkLock(sessionID string, chunkIndex int, timeout time.Duration) (*ChunkLock, error) {
+	lockFileName := fmt.Sprintf("chunk_%d.lock", chunkIndex)
+	lockFilePath := filepath.Join("uploads", sessionID, lockFileName)
+	
+	// ロックファイルの作成または開く
+	lockFile, err := os.OpenFile(lockFilePath, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		return nil, fmt.Errorf("ロックファイル作成エラー: %w", err)
+	}
+
+	// タイムアウト付きでロック取得を試行
+	done := make(chan error, 1)
+	go func() {
+		// LOCK_EX（排他ロック）を取得
+		done <- syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			lockFile.Close()
+			return nil, fmt.Errorf("ロック取得エラー: %w", err)
+		}
+		return &ChunkLock{
+			LockFile: lockFile,
+			FilePath: lockFilePath,
+		}, nil
+	case <-time.After(timeout):
+		lockFile.Close()
+		return nil, errors.New("ロック取得タイムアウト")
+	}
+}
+
+// Release ロックを解放
+func (cl *ChunkLock) Release() error {
+	if cl.LockFile == nil {
+		return nil
+	}
+	
+	// ロック解放
+	err := syscall.Flock(int(cl.LockFile.Fd()), syscall.LOCK_UN)
+	if err != nil {
+		cl.LockFile.Close()
+		return fmt.Errorf("ロック解放エラー: %w", err)
+	}
+	
+	// ファイルクローズ
+	closeErr := cl.LockFile.Close()
+	
+	// ロックファイル削除
+	removeErr := os.Remove(cl.FilePath)
+	
+	if closeErr != nil {
+		return fmt.Errorf("ロックファイルクローズエラー: %w", closeErr)
+	}
+	if removeErr != nil && !os.IsNotExist(removeErr) {
+		return fmt.Errorf("ロックファイル削除エラー: %w", removeErr)
+	}
+	
+	return nil
+}
+
+// AtomicChunkWrite 原子的なチャンク書き込み
+func AtomicChunkWrite(filePath string, data []byte) error {
+	// 一時ファイルパスを生成
+	tempFilePath := filePath + ".tmp." + generateRandomString(8)
+	
+	// 一時ファイルに書き込み
+	tempFile, err := os.Create(tempFilePath)
+	if err != nil {
+		return fmt.Errorf("一時ファイル作成エラー: %w", err)
+	}
+	
+	// データ書き込み
+	_, writeErr := tempFile.Write(data)
+	closeErr := tempFile.Close()
+	
+	if writeErr != nil {
+		os.Remove(tempFilePath) // クリーンアップ
+		return fmt.Errorf("一時ファイル書き込みエラー: %w", writeErr)
+	}
+	
+	if closeErr != nil {
+		os.Remove(tempFilePath) // クリーンアップ
+		return fmt.Errorf("一時ファイルクローズエラー: %w", closeErr)
+	}
+	
+	// 一時ファイルを最終ファイルに原子的に移動
+	if err := os.Rename(tempFilePath, filePath); err != nil {
+		os.Remove(tempFilePath) // クリーンアップ
+		return fmt.Errorf("ファイル移動エラー: %w", err)
+	}
+	
+	return nil
+}
+
+// generateRandomString ランダム文字列生成（内部用）
+func generateRandomString(length int) string {
+	bytes := make([]byte, length)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)[:length]
+}
+
+// CheckChunkExists チャンクファイルの存在確認
+func CheckChunkExists(sessionID string, chunkIndex int) (bool, error) {
+	chunkFileName := fmt.Sprintf("chunk_%d.dat", chunkIndex)
+	chunkFilePath := filepath.Join("uploads", sessionID, chunkFileName)
+	
+	_, err := os.Stat(chunkFilePath)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }

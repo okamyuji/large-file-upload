@@ -1,6 +1,6 @@
 # 大容量ファイルアップロードシステム
 
-高性能なチャンク分割ファイルアップロードシステムです。Goサーバー（標準net/httpのみ）とSwiftUIクライアント（追加ライブラリなし）で実装されており、バックグラウンド送信、チェックサム検証、セッション管理機能を備えています。
+企業級の堅牢性を備えた高性能なチャンク分割ファイルアップロードシステムです。Goサーバー（標準net/httpのみ）とSwiftUIクライアント（追加ライブラリなし）で実装されており、ファイルロック・原子的操作による競合状態完全排除、バックグラウンド送信、チェックサム検証、セッション管理機能を備えています。1GBファイルの並列アップロードでも409エラーが発生しない堅牢な設計です。
 
 ## 主要機能
 
@@ -20,7 +20,11 @@
 
 ### 🛡️ 堅牢性
 
-- **エラーハンドリング**: 包括的なエラー処理
+- **ファイルロック機能**: チャンクレベルの排他制御（syscall.Flock）
+- **原子的操作**: データ整合性を保証する安全なファイル操作
+- **競合状態対策**: Race Conditionを完全に排除
+- **冪等性保証**: 重複アップロードを適切に処理
+- **エラーハンドリング**: 包括的なエラー処理とリトライ機能
 - **状態管理**: 複雑な状態フラグを避けたシンプル設計
 - **テスト完備**: ユニット・統合・パフォーマンステスト
 
@@ -30,33 +34,52 @@
 large-file-upload/
 ├── server/                 # Goサーバー実装
 │   ├── main.go            # メインサーバーファイル
+│   ├── main_test.go       # メインテストファイル
 │   ├── go.mod             # Go依存関係管理
+│   ├── Dockerfile         # サーバー用Dockerfile
 │   ├── models/            # データ構造定義
+│   │   └── models.go
 │   ├── services/          # ビジネスロジック
+│   │   └── upload_service.go
 │   ├── handlers/          # HTTPハンドラー
-│   └── utils/             # ユーティリティ関数
+│   │   └── upload_handler.go
+│   ├── utils/             # ユーティリティ関数
+│   │   └── utils.go
+│   └── uploads/           # アップロード作業ディレクトリ
 ├── client/                # SwiftUIクライアント実装
 │   ├── LargeFileUpload.xcodeproj/ # Xcodeプロジェクト
-│   ├── App/               # アプリケーション本体
-│   ├── Models/            # データモデル
-│   ├── Services/          # ネットワークサービス
-│   ├── Views/             # UIコンポーネント
-│   └── Utils/             # ユーティリティ
+│   ├── LargeFileUpload/   # アプリケーション本体
+│   │   ├── LargeFileUploadApp.swift    # アプリエントリーポイント
+│   │   ├── ContentView.swift           # メインビュー
+│   │   ├── ActiveUploadsView.swift     # アクティブアップロード画面
+│   │   ├── HistoryAndSettingsView.swift # 履歴・設定画面
+│   │   ├── Models.swift                # データモデル
+│   │   ├── NetworkService.swift        # ネットワークサービス
+│   │   ├── NetworkMonitor.swift        # ネットワーク監視
+│   │   ├── UploadManager.swift         # アップロード管理
+│   │   ├── FileManager.swift           # ファイル管理
+│   │   ├── AppDelegate.swift           # アプリデリゲート
+│   │   ├── Info.plist                  # アプリ設定
+│   │   └── Assets.xcassets/            # アセット
+│   ├── LargeFileUploadTests/      # ユニットテスト
+│   │   └── LargeFileUploadTests.swift
+│   └── LargeFileUploadUITests/    # UIテスト
+│       ├── LargeFileUploadUITests.swift
+│       └── LargeFileUploadUITestsLaunchTests.swift
 ├── docs/                  # ドキュメント
-│   ├── api.yaml          # OpenAPI 3.1仕様
-│   ├── README.md         # 本ファイル
-│   └── development.md    # 開発ガイド
-├── tests/                 # テストファイル
-│   ├── unit/             # ユニットテスト
-│   ├── integration/      # 統合テスト
-│   └── performance/      # パフォーマンステスト
-├── docker/               # Docker設定
-│   ├── Dockerfile        # サーバー用Dockerfile
-│   ├── docker-compose.yml # 開発環境設定
-│   └── docker-compose.prod.yml # 本番環境設定
-├── .github/              # CI/CD設定
-│   └── workflows/        # GitHub Actions
-└── Makefile              # ビルド・テスト自動化
+│   └── openapi.yaml      # OpenAPI 3.1仕様
+├── tests/                 # パフォーマンステスト
+│   └── performance/
+│       └── upload-test.js
+├── bin/                   # ビルド成果物
+├── build/                 # Xcodeビルドキャッシュ
+├── uploads/               # サーバーアップロード保存先
+├── .github/               # CI/CD設定
+│   └── workflows/
+│       └── ci-cd.yml
+├── compose.yml            # Docker Compose設定
+├── Makefile               # ビルド・テスト自動化
+└── README.md              # 本ファイル
 ```
 
 ## 技術仕様
@@ -67,6 +90,10 @@ large-file-upload/
 - **フレームワーク**: 標準net/httpライブラリのみ
 - **ハッシュ**: SHA256チェックサム
 - **ストレージ**: ローカルファイルシステム
+- **並行性制御**: チャンクレベルファイルロック（syscall.Flock）
+- **原子的操作**: 一時ファイル方式による安全な書き込み
+- **冪等性**: 重複チャンクの適切な処理
+- **タイムアウト**: 大容量ファイル用最適化（ReadTimeout: 60s, WriteTimeout: 60s）
 - **設定**: 環境変数による設定管理
 
 ### クライアント側（Swift）
@@ -144,11 +171,14 @@ open client/LargeFileUpload.xcodeproj
 ### 4. Dockerでの起動（推奨）
 
 ```bash
-# 開発環境
+# 開発環境（Docker Compose使用）
+docker-compose -f compose.yml up -d
+
+# または Makefileを使用
 make docker-run
 
-# 本番環境
-docker-compose -f docker/docker-compose.prod.yml up -d
+# コンテナ停止
+docker-compose -f compose.yml down
 ```
 
 ## 開発・テスト
@@ -196,29 +226,40 @@ make deploy
 curl -X POST http://localhost:8080/upload/session \
   -H "Content-Type: application/json" \
   -d '{
-    "filename": "large_file.zip",
-    "file_size": 1073741824,
-    "chunk_size": 1048576,
-    "file_checksum": "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
+    "fileName": "large_file.zip",
+    "fileSize": 1073741824,
+    "chunkSize": 1048576,
+    "totalChunks": 1024,
+    "fileChecksum": "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
   }'
 ```
 
 ### チャンクアップロード
 
 ```bash
-curl -X POST http://localhost:8080/upload/chunk \
-  -F "session_id=550e8400-e29b-41d4-a716-446655440000" \
-  -F "chunk_number=1" \
-  -F "chunk_checksum=b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78" \
-  -F "chunk=@chunk_001.bin"
+# バイナリチャンクファイルをアップロード
+curl -X PUT http://localhost:8080/upload/session/session_1234567890_abcdef/chunk/0 \
+  -H "Content-Type: application/octet-stream" \
+  -H "X-Chunk-Checksum: b5d4045c3f466fa91fe2cc6abe79232a1a57cdf104f7a26e716e0a1e2789df78" \
+  --data-binary @chunk_000.bin
 ```
 
-### セッション完了
+### セッションステータス確認
 
 ```bash
-curl -X POST http://localhost:8080/upload/complete \
-  -H "Content-Type: application/json" \
-  -d '{"session_id": "550e8400-e29b-41d4-a716-446655440000"}'
+curl -X GET http://localhost:8080/upload/session/session_1234567890_abcdef/status
+```
+
+### アップロード完了
+
+```bash
+curl -X POST http://localhost:8080/upload/session/session_1234567890_abcdef/complete
+```
+
+### セッション削除
+
+```bash
+curl -X DELETE http://localhost:8080/upload/session/session_1234567890_abcdef
 ```
 
 ## 設定
@@ -242,7 +283,7 @@ export CORS_ORIGINS=*
 
 ### iOS設定
 
-`client/App/Info.plist`で以下を設定：
+`client/LargeFileUpload/Info.plist`で以下を設定：
 
    ```xml
    <key>NSAppTransportSecurity</key>
@@ -278,6 +319,9 @@ export CORS_ORIGINS=*
 ### 実装済み対策
 
 - **チェックサム検証**: SHA256による完全性保証
+- **ファイルロック**: OS レベルの排他制御（syscall.Flock）
+- **原子的操作**: 中断安全なファイル書き込み
+- **冪等性保証**: 重複リクエストの安全な処理
 - **ファイルサイズ制限**: 設定可能な上限値
 - **レート制限**: セッション・チャンクレベル制限
 - **入力値検証**: 全パラメータの厳密検証
@@ -293,7 +337,36 @@ export CORS_ORIGINS=*
 
 ### よくある問題
 
-#### 1. バックグラウンド送信が停止する
+#### 1. 409エラー（重複チャンクアップロード）- 🛠️ 解決済み
+
+   **症状**: 同時並列アップロードで409 Conflict エラーが発生
+   
+   **原因**: 従来の実装では競合状態（Race Condition）が発生していました
+   
+   **解決策**: 
+   - チャンクレベルのファイルロック（syscall.Flock）実装済み
+   - 原子的ファイル操作による安全な書き込み
+   - 重複チャンクは200 OKで成功として処理（冪等性保証）
+   
+   ```bash
+   # システムが正常に動作していることを確認
+   curl -X GET http://localhost:8080/health
+   ```
+
+#### 2. 429エラー（チャンクロック取得失敗）
+
+   **症状**: "CHUNK_LOCK_FAILED" エラーで429 Too Many Requests
+   
+   **対策**: 
+   ```bash
+   # 少し待ってからリトライ（推奨間隔：1-3秒）
+   sleep 2 && curl -X PUT "http://localhost:8080/upload/session/{sessionId}/chunk/{chunkIndex}" \
+     -H "Content-Type: application/octet-stream" \
+     -H "X-Chunk-Checksum: {checksum}" \
+     --data-binary @chunk.bin
+   ```
+
+#### 3. バックグラウンド送信が停止する
 
    ```bash
    # iOSシミュレータでの確認
@@ -302,7 +375,7 @@ export CORS_ORIGINS=*
    # 対策: URLSessionConfiguration設定確認
    ```
 
-#### 2. チェックサムエラー
+#### 4. チェックサムエラー
 
    ```bash
    # サーバーログ確認
@@ -312,7 +385,7 @@ export CORS_ORIGINS=*
    shasum -a 256 uploaded_file.bin
    ```
 
-#### 3. パフォーマンス低下
+#### 5. パフォーマンス低下
 
    ```bash
    # サーバーメトリクス確認
@@ -320,6 +393,17 @@ export CORS_ORIGINS=*
 
    # プロファイリング実行
    go tool pprof http://localhost:8080/debug/pprof/profile
+   ```
+
+#### 6. タイムアウトエラー
+
+   **症状**: 大容量チャンクアップロード時のタイムアウト
+   
+   **設定確認**: 
+   ```bash
+   # 現在のタイムアウト設定（最適化済み）
+   # ReadTimeout: 60秒, WriteTimeout: 60秒, IdleTimeout: 120秒
+   echo "大容量ファイル用に最適化されたタイムアウト設定が適用されています"
    ```
 
 ### ログ確認

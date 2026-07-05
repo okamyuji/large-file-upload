@@ -16,9 +16,9 @@ import (
 
 const (
 	DefaultPort            = "8080"
-	ReadTimeout            = 30 * time.Second
-	WriteTimeout           = 30 * time.Second
-	IdleTimeout            = 60 * time.Second
+	ReadTimeout            = 60 * time.Second  // 大容量チャンクアップロード用に延長
+	WriteTimeout           = 60 * time.Second  // レスポンス送信用に延長
+	IdleTimeout            = 120 * time.Second // 接続維持時間を延長
 	SessionCleanupInterval = 1 * time.Hour
 	SessionMaxAge          = 24 * time.Hour
 )

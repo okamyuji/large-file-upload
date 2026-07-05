@@ -153,9 +153,21 @@ func (h *UploadHandler) uploadChunk(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(err.Error(), "セッションが見つかりません") {
 			utils.WriteErrorResponse(w, http.StatusNotFound, "SESSION_NOT_FOUND", "セッションが見つかりません", err.Error())
 		} else if strings.Contains(err.Error(), "既にアップロード済み") {
-			utils.WriteErrorResponse(w, http.StatusConflict, "CHUNK_ALREADY_EXISTS", "チャンクが既に存在します", err.Error())
+			// 409の代わりに200で成功として扱う（冪等性の確保）
+			log.Printf("ℹ️ [HANDLER] チャンク %d は既にアップロード済み、成功として処理 (session: %s)", chunkIndex, sessionID)
+			response := models.ChunkUploadResponse{
+				ChunkIndex: chunkIndex,
+				Status:     "already_uploaded",
+				Message:    "チャンクは既にアップロード済みです",
+			}
+			utils.WriteJSONResponse(w, http.StatusOK, response)
 		} else if strings.Contains(err.Error(), "チェックサム不一致") {
 			utils.WriteErrorResponse(w, http.StatusBadRequest, "CHECKSUM_MISMATCH", "チェックサムが一致しません", err.Error())
+		} else if strings.Contains(err.Error(), "チャンクロック取得エラー") || strings.Contains(err.Error(), "ロック取得タイムアウト") {
+			// チャンクロック取得エラー（並行処理による一時的な問題）
+			utils.WriteErrorResponse(w, http.StatusTooManyRequests, "CHUNK_LOCK_FAILED", "チャンクが他の処理で使用中です。少し待ってからリトライしてください", err.Error())
+		} else if strings.Contains(err.Error(), "無効なチャンクインデックス") {
+			utils.WriteErrorResponse(w, http.StatusBadRequest, "INVALID_CHUNK_INDEX", "無効なチャンクインデックスです", err.Error())
 		} else {
 			utils.WriteErrorResponse(w, http.StatusInternalServerError, "UPLOAD_FAILED", "チャンクアップロードに失敗しました", err.Error())
 		}
