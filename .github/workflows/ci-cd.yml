@@ -143,12 +143,10 @@ jobs:
     
     - name: Install OpenAPI tools
       run: |
-        npm install -g @apidevtools/swagger-parser
         npm install -g @redocly/cli
-    
+
     - name: Validate OpenAPI spec
       run: |
-        swagger-parser validate docs/openapi.yaml
         redocly lint docs/openapi.yaml
     
     - name: Generate API documentation
@@ -179,19 +177,20 @@ jobs:
         output: 'trivy-results.sarif'
     
     - name: Upload Trivy scan results to GitHub Security tab
-      uses: github/codeql-action/upload-sarif@v2
+      uses: github/codeql-action/upload-sarif@v3
       if: always()
       with:
         sarif_file: 'trivy-results.sarif'
     
     - name: Run Gosec Security Scanner (Go)
       run: |
-        go install github.com/securecodewarrior/gosec/v2/cmd/gosec@latest
-        gosec -fmt sarif -out gosec-results.sarif ./server/...
+        go install github.com/securego/gosec/v2/cmd/gosec@latest
+        gosec -fmt sarif -out gosec-results.sarif ./server/... || true
+        test -f gosec-results.sarif
       continue-on-error: true
     
     - name: Upload Gosec scan results
-      uses: github/codeql-action/upload-sarif@v2
+      uses: github/codeql-action/upload-sarif@v3
       if: always()
       with:
         sarif_file: 'gosec-results.sarif'

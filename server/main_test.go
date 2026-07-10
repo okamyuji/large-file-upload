@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"large-file-upload-server/handlers"
@@ -19,12 +20,12 @@ func TestUploadWorkflow(t *testing.T) {
 	uploadService := services.NewUploadService()
 	handler := handlers.NewUploadHandler(uploadService)
 
-	// テストデータ準備
-	testData := "Hello, World! This is test data for chunked upload."
+	// テストデータ準備 (チャンクサイズ 1024 の 3 倍以上でチャンク分割を検証できるように調整)
+	testData := strings.Repeat("Hello, World! This is test data for chunked upload.\n", 60)
 	testDataBytes := []byte(testData)
 	fileChecksum := utils.CalculateChecksum(testDataBytes)
 
-	chunkSize := 10
+	chunkSize := 1024
 	chunks := make([][]byte, 0)
 
 	// データをチャンクに分割
