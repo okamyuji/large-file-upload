@@ -329,6 +329,9 @@ local/
 experimental/
 sandbox/
 
+# repo-root uploads/ created by integration tests
+/uploads/
+
 # =============================================================================
 # End of .gitignore
 # =============================================================================
