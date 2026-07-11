@@ -113,6 +113,15 @@ func WriteErrorResponse(w http.ResponseWriter, statusCode int, errorCode, messag
 	WriteJSONResponse(w, statusCode, errorResp)
 }
 
+// WriteErrorResponseWithRetryAfter Retry-After ヘッダを付与したエラーレスポンスを書き込み
+// retryAfterSeconds は 429/503 で使用。値が 0 の場合はヘッダを設定しない。
+func WriteErrorResponseWithRetryAfter(w http.ResponseWriter, statusCode int, retryAfterSeconds int, errorCode, message string, details ...string) {
+	if retryAfterSeconds > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+	}
+	WriteErrorResponse(w, statusCode, errorCode, message, details...)
+}
+
 // ParsePathParameter パスパラメータを解析
 func ParsePathParameter(path, pattern string) map[string]string {
 	params := make(map[string]string)

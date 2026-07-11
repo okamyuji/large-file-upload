@@ -165,7 +165,7 @@ func (h *UploadHandler) uploadChunk(w http.ResponseWriter, r *http.Request) {
 			utils.WriteErrorResponse(w, http.StatusBadRequest, "CHECKSUM_MISMATCH", "チェックサムが一致しません", err.Error())
 		} else if strings.Contains(err.Error(), "チャンクロック取得エラー") || strings.Contains(err.Error(), "ロック取得タイムアウト") {
 			// チャンクロック取得エラー（並行処理による一時的な問題）
-			utils.WriteErrorResponse(w, http.StatusTooManyRequests, "CHUNK_LOCK_FAILED", "チャンクが他の処理で使用中です。少し待ってからリトライしてください", err.Error())
+			utils.WriteErrorResponseWithRetryAfter(w, http.StatusTooManyRequests, 2, "CHUNK_LOCK_FAILED", "チャンクが他の処理で使用中です。少し待ってからリトライしてください", err.Error())
 		} else if strings.Contains(err.Error(), "無効なチャンクインデックス") {
 			utils.WriteErrorResponse(w, http.StatusBadRequest, "INVALID_CHUNK_INDEX", "無効なチャンクインデックスです", err.Error())
 		} else {
