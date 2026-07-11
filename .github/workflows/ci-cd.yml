@@ -37,7 +37,9 @@ jobs:
         run: go mod download
 
       - name: Run tests with race detector
-        run: go test -v -race -coverprofile=coverage.out ./...
+        # -coverpkg=./... で全パッケージのカバレッジを集計する。
+        # これを付けないと各テストパッケージ単体しか測れず total 0.0% になる。
+        run: go test -v -race -coverpkg=./... -coverprofile=coverage.out ./...
 
       - name: Enforce coverage threshold
         run: |
@@ -150,6 +152,11 @@ jobs:
           scan-ref: '.'
           format: 'sarif'
           output: 'trivy-results.sarif'
+          # CRITICAL / HIGH の脆弱性が見つかったらジョブ失敗にする。
+          # SARIF アップロード自体は code-scanning 有効化前提のため
+          # continue-on-error に落とし、検出結果は job log に残す。
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
 
       - name: Upload Trivy scan results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v3
