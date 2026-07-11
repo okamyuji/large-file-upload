@@ -31,9 +31,10 @@ class UploadManager: ObservableObject {
     private init() {
         setupNotifications()
         loadUploadHistory()
-        // v2: 起動時に OS 所有タスクを reconcile
+        // v3: 起動時に OS 所有タスク reconcile + サーバ SoT 突き合わせで
+        // 完了扱いの自動治癒 / 未送信チャンクの再投入 / 期限切れセッションの破棄を行う
         Task {
-            _ = await NetworkService.shared.reconcileOSOwnedTasks()
+            await NetworkService.shared.reconcileWithServer()
         }
     }
 
@@ -214,8 +215,12 @@ class UploadManager: ObservableObject {
             fileURL: fileURL
         )
 
-        // バックグラウンド安全な状態更新
-        updateStateSafely {
+        // Bug A 対策: 最初のチャンクが到達する前でも Force Quit されたセッションを
+        // 復元できるよう、セッション作成直後に永続化する。
+        // 従来は updateStateSafely (async schedule) → saveActiveStateSync の 2 段構えで
+        // 変更前スナップショットが disk に残る race があった。performStateMutationAndPersist に統一する。
+        performStateMutationAndPersist { [weak self] in
+            guard let self = self else { return }
             self.activeUploads[session.id] = session
             self.isUploading = true
         }
@@ -230,8 +235,19 @@ class UploadManager: ObservableObject {
     func pauseUpload(sessionId: String) {
         guard let session = activeUploads[sessionId] else { return }
 
-        updateSessionSafely(session) { session in
+        // Bug 対策: .paused を必ずディスクにも反映する。以前は updateSessionSafely だけで
+        // save が呼ばれず、Force Quit 後に古い .uploading 状態が復元 → 起動時 reconcile が
+        // 「まだ送信中」と判断して自動再開してしまい、ユーザーの pause が無視されていた。
+        performStateMutationAndPersist { [weak self] in
+            guard let self = self else { return }
             session.updateStatus(.paused)
+            self.updateUploadingStatus()
+        }
+        // BackgroundURLSession の OS 側 in-flight タスクも停止して、pause 後も
+        // 裏で PUT が続くのを防ぐ。cancel された分は resumeSessionFromServer 時に
+        // サーバ側 missingChunks を再取得して自然に再送される。
+        Task {
+            await networkService.pauseOSTasks(sessionId: sessionId)
         }
         AppLog.upload.notice("アップロード一時停止: \(session.fileName)")
     }
@@ -244,11 +260,15 @@ class UploadManager: ObservableObject {
         }
         AppLog.upload.notice("🔄 アップロード再開: \(session.fileName)")
 
+        // Resume Bug 対策: startUpload は「初回・queue 生存前提」の経路であり、
+        // Force Quit 後 / pause 後 / retry 上限後などで queue の有無や isProcessing 状態が
+        // 期待どおりでないケースをカバーできない。resumeSessionFromServer は毎回サーバから
+        // missingChunks を再取得 → queue を作り直し → 送信開始する冪等な経路なので、
+        // 「再開」操作はすべてこちらに寄せる。
         Task {
             do {
-                // BackgroundURLSessionでアップロード再開
-                try await networkService.startUpload(session: session)
-                AppLog.upload.notice("✅ BackgroundURLSessionアップロード再開成功: \(session.fileName)")
+                try await networkService.resumeSessionFromServer(session)
+                AppLog.upload.notice("✅ アップロード再開成功: \(session.fileName)")
             } catch {
                 await handleUploadErrorSafely(session: session, error: error)
             }
@@ -266,8 +286,19 @@ class UploadManager: ObservableObject {
             AppLog.upload.notice("セッション削除エラー: \(error)")
         }
 
-        updateStateSafely {
+        // cancel 時もステージングファイルを掃除する。ユーザーの元ファイルには触らない。
+        FileManager.shared.cleanupStagedFile(sessionId: sessionId, fileURL: session.fileURL)
+
+        // 「キャンセル」も痕跡を履歴に残す。ユーザーが後日「あのファイルどうしたっけ」を追える。
+        // status を .cancelled に遷移 → activeUploads から削除 → history に insert → 永続化を単一トランザクションで。
+        performStateMutationAndPersist { [weak self] in
+            guard let self = self else { return }
+            session.updateStatus(.cancelled)
             self.activeUploads.removeValue(forKey: sessionId)
+            self.uploadHistory.insert(session, at: 0)
+            if self.uploadHistory.count > 50 {
+                self.uploadHistory = Array(self.uploadHistory.prefix(50))
+            }
             self.updateUploadingStatus()
         }
     }
@@ -300,19 +331,18 @@ class UploadManager: ObservableObject {
     }
 
     private func moveToHistorySafely(session: UploadSession) {
-        updateStateSafely {
+        // Bug 対策: discardSession と同じく、変更と save を同一同期ブロックで実行する。
+        // 従来は updateStateSafely (foreground では async) → saveUploadHistory の順で、
+        // 完了処理でも「削除前スナップショットが disk に残る」race があった。
+        performStateMutationAndPersist { [weak self] in
+            guard let self = self else { return }
             self.activeUploads.removeValue(forKey: session.id)
             self.uploadHistory.insert(session, at: 0)
-
-            // 履歴は最大50件まで保持
             if self.uploadHistory.count > 50 {
                 self.uploadHistory = Array(self.uploadHistory.prefix(50))
             }
-
             self.updateUploadingStatus()
         }
-        
-        saveUploadHistory()
     }
 
     // MARK: - Batch Operations
@@ -436,23 +466,17 @@ class UploadManager: ObservableObject {
     // MARK: - Cleanup
 
     func cleanup() {
-        // 完了済みセッションのクリーンアップ
-        let completedSessions = activeUploads.filter {
-            $0.value.status == .completed
+        performStateMutationAndPersist { [weak self] in
+            guard let self = self else { return }
+            let completedSessions = self.activeUploads.filter {
+                $0.value.status == .completed
+            }
+            for (sessionId, _) in completedSessions {
+                self.activeUploads.removeValue(forKey: sessionId)
+            }
+            // 履歴の日付ベース GC は将来対応 (現状は no-op)
+            self.updateUploadingStatus()
         }
-        for (sessionId, _) in completedSessions {
-            activeUploads.removeValue(forKey: sessionId)
-        }
-
-        // 古い履歴の削除（30日以上前）
-        // TODO: 実際の実装では各セッションに作成日時を追加する必要があります
-        uploadHistory.removeAll { session in
-            // 実際の実装では各セッションに作成日時を追加する必要があります
-            false
-        }
-
-        self.updateUploadingStatus()
-        saveUploadHistory()
     }
 }
 
@@ -496,6 +520,83 @@ extension UploadManager {
 extension UploadManager {
     
     // NetworkServiceからの完了通知を受け取る
+    /// 履歴から1件削除して永続化する。UI からの単発削除経路はこれを通す。
+    /// 従来は `uploadManager.uploadHistory.removeAll { $0.id == id }` の直接操作で
+    /// save が呼ばれず、再起動時に復活していた。
+    func deleteHistoryEntry(sessionId: String) {
+        performStateMutationAndPersist { [weak self] in
+            guard let self = self else { return }
+            let before = self.uploadHistory.count
+            self.uploadHistory.removeAll { $0.id == sessionId }
+            let after = self.uploadHistory.count
+            AppLog.upload.notice("🗑 [DELETE HISTORY] session=\(sessionId) removed=\(before - after)")
+        }
+    }
+
+    /// 履歴を全消去して永続化する。「アップロード履歴をクリア」ボタン用。
+    func clearAllHistory() {
+        performStateMutationAndPersist { [weak self] in
+            guard let self = self else { return }
+            let count = self.uploadHistory.count
+            self.uploadHistory.removeAll()
+            AppLog.upload.notice("🗑 [CLEAR HISTORY] cleared=\(count) entries")
+        }
+    }
+
+    /// activeUploads から強制的にセッションを取り除き、履歴に error として記録する。
+    /// - 起動時 reconcile でサーバ側 404 と判明したセッション
+    /// - UI からユーザーが手動で「削除」を選んだセッション
+    /// の両方で使う。history に痕跡を残すのは、後で問い合わせが来たときに
+    /// 「そういうセッションがあった」ことを追える最低限のログのため。
+    ///
+    /// Bug 対策: 以前は `updateStateSafely { ... }` (foreground では async に MainActor Task を積む)
+    /// の直後に saveActiveStateSync() を呼んでいたため、**save が変更前スナップショットを書いてしまい**、
+    /// Force Quit で「削除したはずのセッションが復活」する不具合があった。
+    /// 状態変更と永続化を同一の同期ブロックに閉じ込めることでこの race を排除する。
+    func discardSession(sessionId: String, reason: String) {
+        performStateMutationAndPersist { [weak self] in
+            guard let self = self else { return }
+            guard let session = self.activeUploads[sessionId] else {
+                AppLog.upload.notice("⚠️ discardSession: セッション \(sessionId) が activeUploads にありません")
+                return
+            }
+            AppLog.upload.notice("🗑 [DISCARD] session=\(sessionId) reason=\(reason)")
+            session.updateStatus(.error)
+            self.activeUploads.removeValue(forKey: sessionId)
+            self.uploadHistory.insert(session, at: 0)
+            if self.uploadHistory.count > 50 {
+                self.uploadHistory = Array(self.uploadHistory.prefix(50))
+            }
+            // ステージングファイルは破棄経路でも掃除する。ユーザーの元ファイルは触らない。
+            FileManager.shared.cleanupStagedFile(sessionId: sessionId, fileURL: session.fileURL)
+            self.updateUploadingStatus()
+        }
+    }
+
+    /// 「状態変更 → 永続化」を同一ブロックにまとめて実行する。
+    /// foreground 時は MainActor 上で必ず順序どおりに実行し、background 時は現スレッドで実行する。
+    /// いずれもブロック完了直後に saveActiveStateSync() を呼ぶため
+    /// 「変更が反映される前に save が走る」race が起きない。
+    ///
+    /// 呼び出し規約: activeUploads / uploadHistory / isUploading / 個別 session.status を触る
+    /// すべての経路はこの関数を通す。updateStateSafely + 外側 save の 2 段構えを新規に書かないこと。
+    ///
+    /// 実装上のポイント:
+    /// - Thread.isMainThread ≠ MainActor isolated なので assumeIsolated は使わない。
+    /// - foreground では常に Task { @MainActor in ... } で 1 hop するが、mutation と save が
+    ///   同じ closure に閉じ込められているため、途中で reconcile 等が割り込む可能性はない。
+    func performStateMutationAndPersist(_ mutation: @escaping () -> Void) {
+        if isAppInBackground {
+            mutation()
+            saveActiveStateSync()
+        } else {
+            Task { @MainActor in
+                mutation()
+                self.saveActiveStateSync()
+            }
+        }
+    }
+
     func notifyUploadCompletion(sessionId: String) {
         guard let session = activeUploads[sessionId] else {
             AppLog.upload.notice("⚠️ 完了通知: セッション \(sessionId) が見つかりません")

@@ -38,6 +38,16 @@ struct ActiveUploadsView: View {
                                         showingCancelAlert = true
                                     }
                                 )
+                                .contextMenu {
+                                    Button(role: .destructive) {
+                                        uploadManager.discardSession(
+                                            sessionId: session.id,
+                                            reason: "user-removed"
+                                        )
+                                    } label: {
+                                        Label("進行中から削除", systemImage: "trash")
+                                    }
+                                }
                             }
                         }
                         .padding()
@@ -200,6 +210,7 @@ struct StatusBadge: View {
         case .completed: return .green.opacity(0.2)
         case .error: return .red.opacity(0.2)
         case .paused: return .gray.opacity(0.2)
+        case .cancelled: return .gray.opacity(0.2)
         }
     }
 
@@ -212,6 +223,7 @@ struct StatusBadge: View {
         case .completed: return .green
         case .error: return .red
         case .paused: return .gray
+        case .cancelled: return .gray
         }
     }
 }
@@ -261,7 +273,7 @@ struct ProgressSection: View {
         switch session.status {
         case .error: return .red
         case .completed: return .green
-        case .paused: return .gray
+        case .paused, .cancelled: return .gray
         default: return .blue
         }
     }
@@ -298,25 +310,45 @@ struct ActionButtons: View {
     let onResume: () -> Void
     let onCancel: () -> Void
 
+    // 状態と主アクションの対応を1箇所にまとめる。UI 側で分岐を書き散らかさないため。
+    // - 送信中 (created / ready / uploading): 主アクション = 一時停止
+    // - 一時停止 (paused): 主アクション = 再開
+    // - エラー (error): 主アクション = 再試行 (経路は resume と同じ SoT 再取得)
+    // - completing / completed: 主アクションなし (処理中 or 完了)
+    private enum PrimaryAction { case pause, resume, retry, none }
+
+    private var primaryAction: PrimaryAction {
+        switch session.status {
+        case .created, .ready, .uploading: return .pause
+        case .paused: return .resume
+        case .error: return .retry
+        case .completing, .completed, .cancelled: return .none
+        }
+    }
+
     var body: some View {
         HStack(spacing: 12) {
-            if session.status == .uploading {
+            switch primaryAction {
+            case .pause:
                 Button(action: onPause) {
-                    Label("一時停止", systemImage: "pause.fill")
-                        .font(.caption)
-                }
-                .buttonStyle(SecondaryButtonStyle())
-            } else if session.status == .paused || session.status == .error {
+                    Label("一時停止", systemImage: "pause.fill").font(.caption)
+                }.buttonStyle(SecondaryButtonStyle())
+            case .resume:
                 Button(action: onResume) {
-                    Label("再開", systemImage: "play.fill")
-                        .font(.caption)
-                }
-                .buttonStyle(PrimaryButtonStyle())
+                    Label("再開", systemImage: "play.fill").font(.caption)
+                }.buttonStyle(PrimaryButtonStyle())
+            case .retry:
+                Button(action: onResume) {
+                    Label("再試行", systemImage: "arrow.clockwise").font(.caption)
+                }.buttonStyle(PrimaryButtonStyle())
+            case .none:
+                EmptyView()
             }
 
             Spacer()
 
-            if session.status != .completed {
+            // completed / completing はサーバ側で確定処理中なのでキャンセル不可
+            if session.status != .completed && session.status != .completing {
                 Button(action: onCancel) {
                     Label("キャンセル", systemImage: "xmark")
                         .font(.caption)

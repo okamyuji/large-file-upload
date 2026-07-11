@@ -29,6 +29,17 @@ class NetworkService: NSObject, ObservableObject {
     // エラー回数管理用の簡易実装
     private var errorCounts: [String: Int] = [:]
 
+    /// happy-path 永続化のデバウンス管理。sessionId -> 最終 save 時刻。
+    /// initial(uploadedChunks==1) と complete は無条件で save、それ以外は
+    /// happyPathPersistInterval を超えた場合のみ save して I/O を抑制する。
+    private var lastPersistAt: [String: Date] = [:]
+    private let happyPathPersistInterval: TimeInterval = 2.0
+
+    /// resumeSessionFromServer が「古い OS タスクの掃除」目的で cancel した taskIdentifier の集合。
+    /// delegate 側でここに載っている taskIdentifier の cancel エラーは benign 扱いして
+    /// notifyUploadError を発火させない。pause 経由の cancel (session.status == .paused) と同じ扱い。
+    private var taskIdsPendingResumeCancel: Set<Int> = []
+
     /// 上記のすべての可変辞書 (activeTaskIds/taskStartTimes/currentUploads/uploadQueues/errorCounts/
     /// activeUploadSessions) は複数の実行コンテキスト (URLSession delegate queue / Task / Timer)
     /// から触られるため、直列化するための再入可能ロック。
@@ -45,10 +56,16 @@ class NetworkService: NSObject, ObservableObject {
         private var pendingChunks: [Int] = []
         private var isProcessing = false
         private let sessionId: String
-        
+
         init(sessionId: String, totalChunks: Int) {
             self.sessionId = sessionId
             self.pendingChunks = Array(0..<totalChunks)
+        }
+
+        /// 明示的な chunk 集合で初期化する。resume 経路で「サーバ側 missing のみ」を積むために使う。
+        init(sessionId: String, chunks: [Int]) {
+            self.sessionId = sessionId
+            self.pendingChunks = chunks.sorted()
         }
         
         func getNextChunk() -> Int? {
@@ -203,10 +220,34 @@ class NetworkService: NSObject, ObservableObject {
             responseType: SessionResponse.self
         )
 
+        // Resume Bug 対策: Document Picker が渡すセキュリティスコープ付き URL は
+        // 当該実行中しか読めない。Force Quit → 再起動後は scope が失われ Resume 時に
+        // readChunk が黙って失敗して PUT が飛ばなかった (=「再開が効かない」バグの真因)。
+        // そこでソースファイルをアプリ所有の Documents/uploads/ にステージングしてから
+        // UploadSession に持たせる。以降 session.fileURL はいつでも読める。
+        //
+        // ステージング失敗時はサーバ側にだけセッションが残る「孤立セッション」を防ぐため、
+        // ここで明示的に DELETE してから元のエラーを再送する。
+        let stagedURL: URL
+        do {
+            stagedURL = try FileManager.shared.stageFileForUpload(
+                sourceURL: fileURL,
+                sessionId: response.sessionId
+            )
+        } catch {
+            AppLog.upload.error("⚠️ [ROLLBACK] stageFileForUpload 失敗 → サーバ側セッション削除: \(response.sessionId)")
+            _ = try? await performControlRequest(
+                endpoint: .deleteSession(sessionId: response.sessionId),
+                method: "DELETE",
+                responseType: EmptyResponse.self
+            )
+            throw error
+        }
+
         let session = UploadSession(
             id: response.sessionId,
             fileName: fileInfo.name,
-            fileURL: fileURL,
+            fileURL: stagedURL,
             totalChunks: chunkInfo.totalChunks,
             fileSize: fileInfo.size,
             fileChecksum: fileChecksum,
@@ -403,8 +444,33 @@ class NetworkService: NSObject, ObservableObject {
         )
     }
 
+    /// pauseUpload から呼ぶ。指定 session の OS 側 in-flight タスクをすべて cancel する。
+    /// delegate 側の cleanup (currentUploads / activeTaskIds) は didCompleteWithError で行われる。
+    func pauseOSTasks(sessionId: String) async {
+        let tasks = await backgroundSession.allTasks
+        var canceled = 0
+        for task in tasks {
+            if let url = task.originalRequest?.url,
+               Self.extractSessionId(from: url) == sessionId {
+                task.cancel()
+                canceled += 1
+            }
+        }
+        AppLog.upload.notice("⏸ [PAUSE] session=\(sessionId) cancelled \(canceled) OS tasks")
+        withState {
+            uploadQueues[sessionId]?.setProcessing(false)
+        }
+    }
+
     /// サーバ側の MissingChunks 情報でクライアント側の状態を同期し、未送信チャンクの送信を再開する。
-    /// アプリ再起動時や長時間バックグラウンド後のフォアグラウンド復帰時に呼ぶ。
+    /// アプリ再起動時、長時間バックグラウンド後のフォアグラウンド復帰時、および pause → resume 経路で呼ぶ。
+    ///
+    /// Resume Bug 対策:
+    /// - queue を「サーバ側 missing チャンクのみ」で作り直す (既に到達済みの chunk への再送 PUT を撲滅)
+    /// - 古い queue の isProcessing フラグが true のまま残る詰まりを回避するため、常に queue を作り直す
+    /// - 進行中の OS 側タスクがあれば cancel してから作り直す (delegate 再入や重複送信を防ぐ)
+    /// - session.status を .uploading に統一 (paused/error からの復帰でも UI 表示が整合)
+    /// - missingChunks が空ならサーバ側完了なので completeUpload に進む
     func resumeSessionFromServer(_ session: UploadSession) async throws {
         AppLog.upload.notice("🔁 [RESUME] サーバ状態同期開始: \(session.id)")
         let status = try await getSessionStatus(sessionId: session.id)
@@ -415,14 +481,35 @@ class NetworkService: NSObject, ObservableObject {
         )
         AppLog.upload.notice("🔁 [RESUME] 同期完了: uploaded=\(session.uploadedChunks.count)/\(session.totalChunks) missing=\(status.missingChunks.count)")
 
-        // uploadQueue を再構築 (未送信チャンクのみ)
-        withState {
-            uploadQueues[session.id] = UploadQueue(sessionId: session.id, totalChunks: session.totalChunks)
-            activeUploadSessions[session.id] = session
+        // 進行中の OS タスクがあれば片付ける (このセッション分のみ)。
+        // cancel された taskIdentifier は「resume 由来の意図した cancel」として記録し、
+        // delegate 側でエラー通知に流さないようにする (session.status は .uploading のままなので
+        // paused fast path には乗らない)。
+        let osTasks = await backgroundSession.allTasks
+        for task in osTasks {
+            if let url = task.originalRequest?.url,
+               Self.extractSessionId(from: url) == session.id {
+                withState { taskIdsPendingResumeCancel.insert(task.taskIdentifier) }
+                task.cancel()
+            }
         }
 
-        // 送信再開
-        if !session.isComplete {
+        // クリーンな状態で queue を作り直し、session を再登録、status を .uploading に統一する。
+        withState {
+            uploadQueues[session.id] = UploadQueue(
+                sessionId: session.id,
+                chunks: status.missingChunks
+            )
+            activeUploadSessions[session.id] = session
+            currentUploads.removeValue(forKey: session.id)
+            activeTaskIds.removeValue(forKey: session.id)
+        }
+        session.updateStatus(status.missingChunks.isEmpty ? .completing : .uploading)
+
+        // サーバ側完了なら completeUpload、まだなら次チャンク送信を開始
+        if status.missingChunks.isEmpty {
+            try await completeUpload(session: session)
+        } else {
             try await processNextChunk(session: session)
         }
     }
@@ -533,6 +620,9 @@ class NetworkService: NSObject, ObservableObject {
             uploadQueues.removeValue(forKey: session.id)
             currentUploads.removeValue(forKey: session.id)
         }
+
+        // ステージングした Documents/uploads/ 配下のコピーは完了後に不要なので削除
+        FileManager.shared.cleanupStagedFile(sessionId: session.id, fileURL: session.fileURL)
 
         // UploadManagerに完了を通知
         UploadManager.shared.notifyUploadCompletion(sessionId: session.id)
@@ -689,6 +779,22 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
             ?? "HTTP \(httpResp?.statusCode ?? -1)"
         AppLog.upload.notice("❌ チャンク \(chunkIndex ?? -1) 失敗: \(errorDesc) → decision=\(decision)")
 
+        // Pause / Resume-cleanup 対策: 意図した cancel は .error に落とさず静かに終わる。
+        // 発火経路が 2 つあり、それぞれ判定材料が違うので両方を見る:
+        //   ① pause 由来: pauseUpload が先に session.status = .paused にしてから cancel する
+        //   ② resume 由来: resumeSessionFromServer が古い OS タスク掃除のために cancel する。
+        //      status は .uploading のままなので、taskIdsPendingResumeCancel の membership で判定する。
+        let isCancel = (ns?.domain == NSURLErrorDomain && ns?.code == NSURLErrorCancelled)
+        let isPendingResumeCancel = withState { taskIdsPendingResumeCancel.remove(taskId) != nil }
+        if isCancel && (uploadSession.status == .paused || isPendingResumeCancel) {
+            let reason = isPendingResumeCancel ? "resume-cleanup" : "paused"
+            AppLog.upload.notice("⏸ [BENIGN CANCEL/\(reason)] session=\(sessionId) chunk=\(chunkIndex ?? -1) error 通知せずに終了")
+            if let chunkIndex = chunkIndex {
+                cleanupTemporaryFile(sessionId: sessionId, chunkIndex: chunkIndex)
+            }
+            return
+        }
+
         // fail: UploadManager へ通知して終わり
         switch decision {
         case .fail:
@@ -733,10 +839,17 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
     ) {
         // バックグラウンド時も完全安全：MainActor使用禁止
         session.markChunkUploaded(chunkIndex)
-        
+
         AppLog.upload.notice("📊 [BACKGROUND SAFE] セッション \(sessionId): \(session.uploadedChunks.count)/\(session.totalChunks) 完了")
-        
+
         uploadQueues[sessionId]?.markChunkCompleted(chunkIndex)
+
+        // Bug A 対策: happy-path でも永続化を行う。
+        // - 初回チャンク到達 (uploadedChunks.count == 1) は無条件で save
+        // - 完了時 (isComplete) は無条件で save
+        // - それ以外は同一セッションで happyPathPersistInterval(=2s) を超えた場合のみ save
+        // これにより Force Quit や OS kill でも upload_state.json が最新に近い状態で残る。
+        persistHappyPath(sessionId: sessionId, session: session)
         
         if session.isComplete {
             // 完了処理（Sendable問題を回避するためsessionIdを事前キャプチャ）
@@ -1306,6 +1419,26 @@ extension NetworkService {
         }
     }
 
+    /// happy-path 永続化。initial/complete は無条件、それ以外はデバウンス。
+    /// テストからも呼べるよう internal スコープ。
+    func persistHappyPath(sessionId: String, session: UploadSession) {
+        let count = session.uploadedChunks.count
+        let isFirst = count == 1
+        let isComplete = session.isComplete
+        var shouldPersist = isFirst || isComplete
+        if !shouldPersist {
+            let last = withState { lastPersistAt[sessionId] }
+            if let last {
+                shouldPersist = Date().timeIntervalSince(last) >= happyPathPersistInterval
+            } else {
+                shouldPersist = true
+            }
+        }
+        guard shouldPersist else { return }
+        withState { lastPersistAt[sessionId] = Date() }
+        UploadManager.shared.saveActiveStateSync()
+    }
+
     /// 新規 URLSessionUploadTask を作成し、earliestBeginDate を設定する。
     /// ロック非保持で呼べる (任意のコンテキストから安全)。retry 経路以外では
     /// earliestBeginDate=nil で通常アップロード。
@@ -1388,6 +1521,50 @@ extension NetworkService {
 
     /// app 起動時に OS 所有タスクを reconcile する。
     /// - Returns: OS 側で live なタスクの (sessionId, chunkIndex) セット
+    /// 起動時に OS 所有タスクを reconcile したうえで、activeUploads の各セッションを
+    /// サーバの `GET /status` と突き合わせて 3 経路に振り分ける:
+    /// - 404: サーバ側に存在しない → `UploadManager.discardSession(reason:"server-404")`
+    /// - missingChunks 空: サーバ側で全チャンク到達済 → `completeUpload(session:)` で history 移動
+    /// - missingChunks あり + OS 側にタスク無し: `resumeSessionFromServer(session)` で再投入
+    /// - missingChunks あり + OS 側にタスク有り: OS が既に送信中 → 何もしない
+    func reconcileWithServer() async {
+        let liveKeys = await reconcileOSOwnedTasks()
+        let liveSessionIds: Set<String> = Set(liveKeys.compactMap {
+            $0.split(separator: ":").first.map(String.init)
+        })
+        let sessions = await MainActor.run { Array(UploadManager.shared.activeUploads.values) }
+        AppLog.upload.notice("🔁 [RECONCILE:SERVER] 対象セッション \(sessions.count) 件")
+        for session in sessions {
+            do {
+                let status = try await getSessionStatus(sessionId: session.id)
+                if status.missingChunks.isEmpty {
+                    AppLog.upload.notice("✅ [RECONCILE] session=\(session.id) はサーバ側完了 → completeUpload")
+                    NetworkService.syncUploadedChunks(
+                        session: session,
+                        missingChunks: [],
+                        totalChunks: session.totalChunks
+                    )
+                    try? await completeUpload(session: session)
+                } else if liveSessionIds.contains(session.id) {
+                    AppLog.upload.notice("🔁 [RECONCILE] session=\(session.id) は OS 側で送信中 → 待機")
+                } else {
+                    AppLog.upload.notice("🔁 [RECONCILE] session=\(session.id) 残 \(status.missingChunks.count) チャンク → resume")
+                    try? await resumeSessionFromServer(session)
+                }
+            } catch let NetworkError.httpError(code, _) where code == 404 {
+                AppLog.upload.notice("🗑 [RECONCILE] session=\(session.id) はサーバ 404 → discard")
+                // discard 前に OS 側の live task も片付ける。片付けを怠ると、
+                // discard 後に delegate が「不明セッションの chunk 完了」を受けて誤動作する。
+                await cancelOSTasks(sessionId: session.id)
+                await MainActor.run {
+                    UploadManager.shared.discardSession(sessionId: session.id, reason: "server-404")
+                }
+            } catch {
+                AppLog.upload.error("⚠️ [RECONCILE] session=\(session.id) status 取得失敗 (\(error.localizedDescription)) → 次回起動時に再試行")
+            }
+        }
+    }
+
     func reconcileOSOwnedTasks() async -> Set<String> {
         let tasks = await backgroundSession.allTasks
         var live: Set<String> = []
