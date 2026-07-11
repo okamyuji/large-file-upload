@@ -70,24 +70,27 @@ jobs:
         name: server-binary
         path: ./server/server
 
-  # iOS アプリのテストとビルド
+  # iOS アプリのビルド検証 (テストはスタブのみのため build のみ検証)
   test-ios-app:
     name: Test iOS App
     runs-on: macos-latest
-    
+    # macos-latest でのシミュレータ起動 + 初回ビルドは冷たい状態で 25 分超えるため
+    # ハード上限を設けて暴走を防ぐ
+    timeout-minutes: 15
+
     defaults:
       run:
         working-directory: ./client
-    
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-    
+
     - name: Select Xcode version
       run: |
         # ランナーで利用可能な最新の Xcode を選ぶ (macos-latest の default 版)
         sudo xcode-select -s "$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)/Contents/Developer" || sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-    
+
     - name: Cache Xcode DerivedData
       uses: actions/cache@v4
       with:
@@ -95,23 +98,19 @@ jobs:
         key: ${{ runner.os }}-xcode-derived-data-${{ hashFiles('**/*.xcodeproj/**') }}
         restore-keys: |
           ${{ runner.os }}-xcode-derived-data-
-    
-    - name: Build and Test
+
+    - name: Build for iOS Simulator
+      # 現状のテスト (LargeFileUploadTests は空の @Test example()、UI テストは launch のみ)
+      # ではシミュレータ起動 + 実機テストを走らせる価値がないため build 検証だけ行う。
+      # 実質的なユニット/UI テストが増えたら xcodebuild test に戻す。
       run: |
-        # ランナー上で利用可能な最新の iPhone シミュレータを動的に選ぶ
-        DEST=$(xcrun simctl list devices available | awk '/^-- iOS/{iOS=$0; next} /iPhone/ && iOS!="" {print iOS, $0}' | tail -1)
-        SIM=$(echo "$DEST" | sed -n 's/.*\(iPhone [^(]*\) (.*/\1/p' | sed 's/ *$//')
-        OS=$(echo "$DEST" | sed -n 's/^-- iOS \([0-9.]*\).*/\1/p')
-        if [ -z "$SIM" ] || [ -z "$OS" ]; then
-          echo "iPhone シミュレータが見つかりません"; exit 1
-        fi
-        echo "使用シミュレータ: $SIM / iOS $OS"
         xcodebuild \
           -project LargeFileUpload.xcodeproj \
           -scheme LargeFileUpload \
-          -destination "platform=iOS Simulator,name=$SIM,OS=$OS" \
+          -destination 'generic/platform=iOS Simulator' \
           -derivedDataPath DerivedData \
-          clean test
+          CODE_SIGNING_ALLOWED=NO \
+          clean build
     
     - name: Upload test results
       uses: actions/upload-artifact@v4
