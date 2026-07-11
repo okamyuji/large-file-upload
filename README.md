@@ -1,32 +1,31 @@
 # 大容量ファイルアップロードシステム
 
-企業級の堅牢性を備えた高性能なチャンク分割ファイルアップロードシステムです。Goサーバー（標準net/httpのみ）とSwiftUIクライアント（追加ライブラリなし）で実装されており、ファイルロック・原子的操作による競合状態完全排除、バックグラウンド送信、チェックサム検証、セッション管理機能を備えています。1GBファイルの並列アップロードでも409エラーが発生しない堅牢な設計です。
+チャンク分割ファイルアップロードシステムです。Goサーバー（標準net/httpのみ）とSwiftUIクライアント（追加ライブラリなし）で実装されており、ファイルロック・原子的操作による競合状態対策、バックグラウンド送信、チェックサム検証、セッション管理機能を備えています。iPhone実機で1GBファイルのアップロード完走を検証済みです。
 
 ## 主要機能
 
-### 🚀 高性能アップロード
+### アップロード方式
 
-- **チャンク分割アップロード**: 大容量ファイルを効率的に分割して送信
-- **並列処理**: フォアグラウンド時の高速アップロード
-- **SHA256チェックサム**: ファイル整合性の完全保証
-- **セッション管理**: 中断・再開可能なアップロード処理
+- チャンク分割アップロード: ファイルサイズに応じて1MB〜10MBのチャンクへ適応分割（総チャンク数200以下）
+- 全チャンク一括投入: 開始・再開時に残りチャンクのPUTタスクをすべてBackgroundURLSessionへ投入し、httpMaximumConnectionsPerHost=1で逐次配送
+- SHA256チェックサム: チャンク単位とファイル全体の整合性検証
+- セッション管理: 中断・再開可能なアップロード処理（サーバのmissingChunksをSoTとして再開）
 
-### 📱 iOS最適化
+### iOS対応
 
-- **バックグラウンド送信**: iOS 30秒制限を超えた継続送信
-- **指数バックオフ回避**: 最大4並列での逐次処理
-- **画面ロック対応**: 自動スリープ時の送信継続
-- **SwiftUI純正実装**: 追加ライブラリ不使用
+- バックグラウンド送信: 投入済みタスクをnsurlsessiondが所有するため、アプリのサスペンド中も送信が継続
+- ネイティブリトライ: Task.sleepを使わず、earliestBeginDateによるOS所有のリトライスケジューリング（指数バックオフ+Retry-After尊重）
+- 画面ロック対応: 自動スリープ時の送信継続
+- SwiftUI純正実装: 追加ライブラリ不使用
 
-### 🛡️ 堅牢性
+### 堅牢性
 
-- **ファイルロック機能**: チャンクレベルの排他制御（syscall.Flock）
-- **原子的操作**: データ整合性を保証する安全なファイル操作
-- **競合状態対策**: Race Conditionを完全に排除
-- **冪等性保証**: 重複アップロードを適切に処理
-- **エラーハンドリング**: 包括的なエラー処理とリトライ機能
-- **状態管理**: 複雑な状態フラグを避けたシンプル設計
-- **テスト完備**: ユニット・統合・パフォーマンステスト
+- ファイルロック機能: チャンクレベルの排他制御（syscall.Flock）
+- 原子的操作: 一時ファイル方式による安全なファイル書き込み
+- 冪等性保証: 重複チャンクは200 OK（already_uploaded）で処理
+- エラー分類: RetryClassifierによる恒久エラー・過負荷・一時エラーの振り分け
+- 状態永続化: happy-pathでもupload_state.jsonへ保存し、Force Quit後も復元
+- テスト: ユニット・実サーバ統合・fault-injectionテスト
 
 ## プロジェクト構造
 
@@ -43,6 +42,8 @@ large-file-upload/
 │   │   └── upload_service.go
 │   ├── handlers/          # HTTPハンドラー
 │   │   └── upload_handler.go
+│   ├── middleware/        # fault-injection等のミドルウェア
+│   │   └── fault_injection.go
 │   ├── utils/             # ユーティリティ関数
 │   │   └── utils.go
 │   └── uploads/           # アップロード作業ディレクトリ
@@ -58,11 +59,13 @@ large-file-upload/
 │   │   ├── NetworkMonitor.swift        # ネットワーク監視
 │   │   ├── UploadManager.swift         # アップロード管理
 │   │   ├── FileManager.swift           # ファイル管理
+│   │   ├── RetryPolicy.swift           # リトライ間隔ポリシー
+│   │   ├── RetryDecision.swift         # エラー分類（RetryClassifier）
+│   │   ├── AppLogger.swift             # os.Loggerラッパー
 │   │   ├── AppDelegate.swift           # アプリデリゲート
 │   │   ├── Info.plist                  # アプリ設定
 │   │   └── Assets.xcassets/            # アセット
-│   ├── LargeFileUploadTests/      # ユニットテスト
-│   │   └── LargeFileUploadTests.swift
+│   ├── LargeFileUploadTests/      # ユニット・統合テスト
 │   └── LargeFileUploadUITests/    # UIテスト
 │       ├── LargeFileUploadUITests.swift
 │       └── LargeFileUploadUITestsLaunchTests.swift
@@ -71,7 +74,7 @@ large-file-upload/
 ├── tests/                 # パフォーマンステスト
 │   └── performance/
 │       └── upload-test.js
-├── bin/                   # ビルド成果物
+├── bin/                   # テストスクリプト（bg_upload_test.sh）
 ├── build/                 # Xcodeビルドキャッシュ
 ├── uploads/               # サーバーアップロード保存先
 ├── .github/               # CI/CD設定
@@ -100,14 +103,14 @@ large-file-upload/
 
 - **言語**: Swift 5.9+
 - **フレームワーク**: SwiftUI（追加ライブラリなし）
-- **バックグラウンド**: URLSessionConfiguration.background
-- **並列制限**: 最大4並列（iOS制限回避）
-- **対応OS**: iOS 15.0+
+- **バックグラウンド**: URLSessionConfiguration.background（全チャンク一括投入、httpMaximumConnectionsPerHost=1で逐次配送）
+- **リトライ**: URLSessionTask.earliestBeginDateによるOS所有スケジューリング
+- **対応OS**: iOS 18.5+
 
 ### API仕様
 
 - **プロトコル**: HTTP/1.1, HTTP/2
-- **認証**: 基本認証（本番環境ではJWT推奨）
+- **認証**: なし（検証用実装。本番環境ではJWT等の追加が必要）
 - **フォーマット**: OpenAPI 3.1準拠
 - **エンドポイント**: RESTful API設計
 
@@ -268,24 +271,23 @@ curl -X DELETE http://localhost:8080/upload/session/session_1234567890_abcdef
 
 ```bash
 # サーバー設定
-export SERVER_PORT=8080
-export SERVER_HOST=0.0.0.0
-export UPLOAD_DIR=./uploads
-export MAX_CHUNK_SIZE=10485760  # 10MB
-export SESSION_TIMEOUT=3600     # 1時間
+export PORT=8080  # 待ち受けポート（未設定時は8080）
 
-# セキュリティ設定
-export AUTH_ENABLED=true
-export JWT_SECRET=your-secret-key
-export CORS_ENABLED=true
-export CORS_ORIGINS=*
+# fault-injectionテスト用（本番では設定しない）
+export LARGE_FILE_UPLOAD_FAULT_RATE=0.15  # チャンクPUTを指定確率で503にする
+export LARGE_FILE_UPLOAD_FAULT_SEED=42    # 乱数シード（再現用、省略可）
 ```
+
+チャンクサイズの上限（10MB）・下限（1KB）とセッション検証はサーバコード内で固定です。
 
 ### iOS設定
 
-`client/LargeFileUpload/Info.plist`で以下を設定：
+`client/LargeFileUpload/Info.plist`で以下を設定します。
 
    ```xml
+   <!-- 接続先サーバ（環境変数 LARGE_FILE_UPLOAD_SERVER でも上書き可能） -->
+   <key>LARGE_FILE_UPLOAD_SERVER</key>
+   <string>http://192.168.x.x:8080</string>
    <key>NSAppTransportSecurity</key>
    <dict>
       <key>NSAllowsArbitraryLoads</key>
@@ -293,38 +295,37 @@ export CORS_ORIGINS=*
    </dict>
    <key>UIBackgroundModes</key>
    <array>
-      <string>background-processing</string>
       <string>background-fetch</string>
+      <string>background-processing</string>
+      <string>background-upload</string>
    </array>
    ```
 
 ## パフォーマンス特性
 
-### ベンチマーク結果
+iPhone 12 Pro実機とローカルMacサーバでの実測値です（2026-07）。
 
-- **チャンクサイズ**: 1MB推奨（1KB～10MBの範囲で調整可能）
-- **並列数**: フォアグラウンド8並列、バックグラウンド4並列
-- **スループット**: 10Gbps環境で800Mbps達成
-- **レイテンシ**: チャンクあたり平均50ms
-- **メモリ使用量**: サーバー側50MB、クライアント側30MB
+- 1GBファイル単発: USB tunnel経由で約50秒（チャンク128個）
+- 200MB×3回連続: 約75秒
+- 906MBファイル: Wi-Fi（IPv6）経由、バックグラウンド移行を挟んで約2分で完走
+- fault-injection（503を15%注入）下の200MB: リトライ経由で約43秒
 
-### スケーラビリティ
+チャンクサイズはファイルサイズから適応的に決まり（1MB〜10MB、総チャンク数200以下）、サーバはチャンクサイズ1KB〜10MBの範囲外を拒否します。
 
-- **同時セッション**: 最大1000セッション
-- **ファイルサイズ**: 理論上無制限（テスト済み：100GB）
-- **チャンク数**: セッションあたり最大100万チャンク
+スケール構成（オブジェクトストレージ直接PUT、Redis/DBでのセッション管理、非同期結合など）はこのリポジトリの範囲外です。設計指針は[解説記事](https://zenn.dev/okamyuji)を参照してください。
 
 ## セキュリティ考慮事項
 
 ### 実装済み対策
 
 - **チェックサム検証**: SHA256による完全性保証
-- **ファイルロック**: OS レベルの排他制御（syscall.Flock）
+- **ファイルロック**: OSレベルの排他制御（syscall.Flock）
 - **原子的操作**: 中断安全なファイル書き込み
 - **冪等性保証**: 重複リクエストの安全な処理
-- **ファイルサイズ制限**: 設定可能な上限値
-- **レート制限**: セッション・チャンクレベル制限
-- **入力値検証**: 全パラメータの厳密検証
+- **チャンクサイズ制限**: 1KB〜10MBの範囲外を拒否
+- **ロック競合時の429**: Retry-Afterヘッダ付きで再試行を誘導
+- **入力値検証**: セッション作成・チャンク受信パラメータの検証
+- **パス操作対策**: 一時ファイル名はセッションIDと連番のみで構成
 
 ### 本番環境推奨設定
 
@@ -337,17 +338,17 @@ export CORS_ORIGINS=*
 
 ### よくある問題
 
-#### 1. 409エラー（重複チャンクアップロード）- 🛠️ 解決済み
+#### 1. 409エラー（重複チャンクアップロード）- 解決済み
 
    **症状**: 同時並列アップロードで409 Conflict エラーが発生
-   
+
    **原因**: 従来の実装では競合状態（Race Condition）が発生していました
-   
-   **解決策**: 
+
+   **解決策**:
    - チャンクレベルのファイルロック（syscall.Flock）実装済み
    - 原子的ファイル操作による安全な書き込み
    - 重複チャンクは200 OKで成功として処理（冪等性保証）
-   
+
    ```bash
    # システムが正常に動作していることを確認
    curl -X GET http://localhost:8080/health
@@ -368,11 +369,15 @@ export CORS_ORIGINS=*
 
 #### 3. バックグラウンド送信が停止する
 
-   ```bash
-   # iOSシミュレータでの確認
-   xcrun simctl spawn booted log show --predicate 'process == "LargeFileUpload"'
+   **症状**: アプリをバックグラウンドにするとチャンク到達が止まり、フォアグラウンド復帰と同時に再開する
 
-   # 対策: URLSessionConfiguration設定確認
+   **原因**: BackgroundURLSessionが送り続けるのは投入済みタスクだけです。チャンク完了のデリゲートで次の1個を投入する逐次方式だと、サスペンド中は次を積む主体が不在になり送信が止まります
+
+   **解決策**: 開始・再開時に残りチャンクのタスクをすべて投入します（本リポジトリではenqueueAllPendingChunksとして実装済み）。切り分けにはサーバ側アクセスログのタイムスタンプを時系列で確認するのが確実です
+
+   ```bash
+   # iOSシミュレータでのクライアントログ確認
+   xcrun simctl spawn booted log show --predicate 'process == "LargeFileUpload"'
    ```
 
 #### 4. チェックサムエラー
@@ -398,13 +403,8 @@ export CORS_ORIGINS=*
 #### 6. タイムアウトエラー
 
    **症状**: 大容量チャンクアップロード時のタイムアウト
-   
-   **設定確認**: 
-   ```bash
-   # 現在のタイムアウト設定（最適化済み）
-   # ReadTimeout: 60秒, WriteTimeout: 60秒, IdleTimeout: 120秒
-   echo "大容量ファイル用に最適化されたタイムアウト設定が適用されています"
-   ```
+
+   **設定確認**: サーバはReadTimeout 60秒、WriteTimeout 60秒で構成されています。クライアント側はチャンク単体300秒、リソース全体7日で構成されています（server/main.go、NetworkService.swiftを参照）
 
 ### ログ確認
 
