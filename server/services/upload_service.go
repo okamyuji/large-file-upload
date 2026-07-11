@@ -308,7 +308,7 @@ func (s *UploadService) validateCreateSessionRequest(req *models.CreateSessionRe
 // cleanupChunkFiles チャンクファイルを削除（最終ファイルは残す）
 func (s *UploadService) cleanupChunkFiles(session *models.UploadSession) {
 	for _, chunkInfo := range session.UploadedChunks {
-		os.Remove(chunkInfo.FilePath)
+		_ = os.Remove(chunkInfo.FilePath)
 	}
 }
 
@@ -335,7 +335,7 @@ func (s *UploadService) CleanupExpiredSessions(maxAge time.Duration) int {
 
 	for sessionID, session := range s.sessions {
 		if now.Sub(session.UpdatedAt) > maxAge {
-			utils.CleanupWorkingDirectory(session.WorkingDir)
+			_ = utils.CleanupWorkingDirectory(session.WorkingDir)
 			delete(s.sessions, sessionID)
 			deletedCount++
 		}

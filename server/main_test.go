@@ -273,7 +273,9 @@ func TestErrorCases(t *testing.T) {
 		handler.ServeHTTP(w, req)
 
 		var resp models.SessionResponse
-		json.Unmarshal(w.Body.Bytes(), &resp)
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("レスポンス解析エラー: %v", err)
+		}
 		sessionID := resp.SessionID
 
 		// 間違ったチェックサムでチャンクアップロード
@@ -308,7 +310,7 @@ func TestHealthEndpoint(t *testing.T) {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"healthy"}`))
+		_, _ = w.Write([]byte(`{"status":"healthy"}`))
 	})
 
 	req := httptest.NewRequest("GET", "/health", nil)

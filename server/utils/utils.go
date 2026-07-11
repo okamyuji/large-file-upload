@@ -24,7 +24,11 @@ import (
 func GenerateSessionID() string {
 	timestamp := time.Now().Unix()
 	randomBytes := make([]byte, 8)
-	rand.Read(randomBytes)
+	if _, err := rand.Read(randomBytes); err != nil {
+		// crypto/rand.Read はエントロピー枯渇時のみ失敗するので、
+		// タイムスタンプのみに縮退してでも ID を返す
+		return fmt.Sprintf("session_%d_0000000000000000", timestamp)
+	}
 	return fmt.Sprintf("session_%d_%s", timestamp, hex.EncodeToString(randomBytes))
 }
 
@@ -34,7 +38,7 @@ func CalculateFileChecksum(filePath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("ファイルを開けません: %w", err)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	hasher := sha256.New()
 	if _, err := io.Copy(hasher, file); err != nil {
@@ -47,7 +51,7 @@ func CalculateFileChecksum(filePath string) (string, error) {
 // CalculateChecksum データのSHA256チェックサムを計算
 func CalculateChecksum(data []byte) string {
 	hasher := sha256.New()
-	hasher.Write(data)
+	_, _ = hasher.Write(data)
 	return hex.EncodeToString(hasher.Sum(nil))
 }
 
@@ -194,7 +198,7 @@ func CombineChunks(session *models.UploadSession) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("最終ファイル作成エラー: %w", err)
 	}
-	defer finalFile.Close()
+	defer func() { _ = finalFile.Close() }()
 
 	// チャンクを順序通りに結合
 	for i := 0; i < session.TotalChunks; i++ {
@@ -209,7 +213,7 @@ func CombineChunks(session *models.UploadSession) (string, error) {
 		}
 
 		_, err = io.Copy(finalFile, chunkFile)
-		chunkFile.Close()
+		_ = chunkFile.Close()
 
 		if err != nil {
 			return "", fmt.Errorf("チャンク %d 結合エラー: %w", i, err)
@@ -257,7 +261,7 @@ func AcquireChunkLock(sessionID string, chunkIndex int, timeout time.Duration) (
 	select {
 	case err := <-done:
 		if err != nil {
-			lockFile.Close()
+			_ = lockFile.Close()
 			return nil, fmt.Errorf("ロック取得エラー: %w", err)
 		}
 		return &ChunkLock{
@@ -265,7 +269,7 @@ func AcquireChunkLock(sessionID string, chunkIndex int, timeout time.Duration) (
 			FilePath: lockFilePath,
 		}, nil
 	case <-time.After(timeout):
-		lockFile.Close()
+		_ = lockFile.Close()
 		return nil, errors.New("ロック取得タイムアウト")
 	}
 }
@@ -279,7 +283,7 @@ func (cl *ChunkLock) Release() error {
 	// ロック解放
 	err := syscall.Flock(int(cl.LockFile.Fd()), syscall.LOCK_UN)
 	if err != nil {
-		cl.LockFile.Close()
+		_ = cl.LockFile.Close()
 		return fmt.Errorf("ロック解放エラー: %w", err)
 	}
 	
@@ -315,18 +319,18 @@ func AtomicChunkWrite(filePath string, data []byte) error {
 	closeErr := tempFile.Close()
 	
 	if writeErr != nil {
-		os.Remove(tempFilePath) // クリーンアップ
+		_ = os.Remove(tempFilePath) // クリーンアップ
 		return fmt.Errorf("一時ファイル書き込みエラー: %w", writeErr)
 	}
 	
 	if closeErr != nil {
-		os.Remove(tempFilePath) // クリーンアップ
+		_ = os.Remove(tempFilePath) // クリーンアップ
 		return fmt.Errorf("一時ファイルクローズエラー: %w", closeErr)
 	}
 	
 	// 一時ファイルを最終ファイルに原子的に移動
 	if err := os.Rename(tempFilePath, filePath); err != nil {
-		os.Remove(tempFilePath) // クリーンアップ
+		_ = os.Remove(tempFilePath) // クリーンアップ
 		return fmt.Errorf("ファイル移動エラー: %w", err)
 	}
 	
@@ -336,7 +340,7 @@ func AtomicChunkWrite(filePath string, data []byte) error {
 // generateRandomString ランダム文字列生成（内部用）
 func generateRandomString(length int) string {
 	bytes := make([]byte, length)
-	rand.Read(bytes)
+	_, _ = rand.Read(bytes)
 	return hex.EncodeToString(bytes)[:length]
 }
 

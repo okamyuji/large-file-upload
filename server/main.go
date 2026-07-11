@@ -50,7 +50,7 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"healthy","timestamp":"` + time.Now().Format(time.RFC3339) + `"}`))
+		_, _ = w.Write([]byte(`{"status":"healthy","timestamp":"` + time.Now().Format(time.RFC3339) + `"}`))
 	})
 
 	// ルートパス
@@ -67,7 +67,7 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"message":"大容量ファイル分割アップロードAPI","version":"1.0.0"}`))
+		_, _ = w.Write([]byte(`{"message":"大容量ファイル分割アップロードAPI","version":"1.0.0"}`))
 	})
 
 	// ポート設定
