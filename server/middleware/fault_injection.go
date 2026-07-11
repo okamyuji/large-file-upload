@@ -68,6 +68,9 @@ func (c *FaultInjectionConfig) shouldInject(r *http.Request) bool {
 
 // Handler wraps the given handler with fault injection.
 // When disabled (Rate == 0), it is a pass-through with zero overhead beyond the wrapper call.
+//
+// Injected responses use the same structured JSON error format as the real API
+// so client-side error handling exercises the identical code path in tests.
 func (c *FaultInjectionConfig) Handler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if c.shouldInject(r) {
@@ -75,7 +78,9 @@ func (c *FaultInjectionConfig) Handler(next http.Handler) http.Handler {
 			if code == 0 {
 				code = http.StatusServiceUnavailable
 			}
-			http.Error(w, "fault-injected", code)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(`{"error":"FAULT_INJECTED","message":"fault-injected (test/dev only)"}`))
 			return
 		}
 		next.ServeHTTP(w, r)

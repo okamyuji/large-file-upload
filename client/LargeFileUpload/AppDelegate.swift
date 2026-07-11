@@ -59,16 +59,22 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     @available(iOS 13.0, *)
     private func handleBackgroundUploadTask(task: BGProcessingTask) {
         AppLog.upload.notice("🔄 バックグラウンドアップロードタスク実行")
-        
-        // タスクの期限切れ処理
+
+        var workTask: Task<Void, Never>?
+
+        // タスクの期限切れ処理: 進行中の Task をキャンセルしてから setTaskCompleted(false) を呼ぶ
         task.expirationHandler = {
             AppLog.upload.notice("⏰ バックグラウンドタスクが期限切れになりました")
+            workTask?.cancel()
             task.setTaskCompleted(success: false)
         }
-        
-        // バックグラウンドでのアップロード処理
-        Task {
+
+        // バックグラウンドでのアップロード処理。Task ハンドルを保持し、
+        // 期限切れで cancel された場合は setTaskCompleted を呼ばない
+        // (BGProcessingTask.setTaskCompleted の二重呼び出しは未定義動作)。
+        workTask = Task {
             await NetworkService.shared.refreshAllSessionStatus()
+            guard !Task.isCancelled else { return }
             task.setTaskCompleted(success: true)
         }
     }

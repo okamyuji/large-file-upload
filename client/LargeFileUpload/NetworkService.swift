@@ -625,22 +625,37 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
     ) {
         let taskId = task.taskIdentifier
         let originalURL = task.originalRequest?.url?.absoluteString ?? "不明"
-        
-        guard let sessionId = findSessionIdForTask(task: task),
-              let uploadSession = activeUploadSessions[sessionId],
-              let queue = uploadQueues[sessionId] else {
-            AppLog.upload.notice("⚠️ タスク情報が見つかりません: TaskID(\(taskId)) URL(\(originalURL))")
-            return
-        }
 
-        let chunkIndex = extractChunkIndex(from: task.originalRequest?.url)
-        
+        // lookup + cleanup を単一 withState でアトミックに (race 対策)。
+        // sessionId/uploadSession/queue の読み出しと 4 dict の cleanup を同じ critical
+        // section で行い、途中で deleteSession 等が割り込む可能性を排除する。
+        struct DelegateContext {
+            let sessionId: String
+            let uploadSession: UploadSession
+            let queue: UploadQueue
+        }
+        var ctx: DelegateContext?
         withState {
+            guard let sessionId = findSessionIdForTask(task: task),
+                  let uploadSession = activeUploadSessions[sessionId],
+                  let queue = uploadQueues[sessionId] else {
+                return
+            }
+            ctx = DelegateContext(sessionId: sessionId, uploadSession: uploadSession, queue: queue)
             currentUploads.removeValue(forKey: sessionId)
             queue.setProcessing(false)
             activeTaskIds.removeValue(forKey: sessionId)
             taskStartTimes.removeValue(forKey: sessionId)
         }
+        guard let ctx else {
+            AppLog.upload.notice("⚠️ タスク情報が見つかりません: TaskID(\(taskId)) URL(\(originalURL))")
+            return
+        }
+        let sessionId = ctx.sessionId
+        let uploadSession = ctx.uploadSession
+        _ = ctx.queue // 一時的な保持は cleanup 時のみ必要
+
+        let chunkIndex = extractChunkIndex(from: task.originalRequest?.url)
         
         AppLog.upload.notice("📋 [TASK COMPLETED] TaskID(\(taskId)) チャンク(\(chunkIndex ?? -1)) セッション(\(sessionId))")
         AppLog.upload.notice("🧹 [CLEANUP] タスク監視情報をクリーンアップ")
@@ -1246,7 +1261,7 @@ extension NetworkService {
         // Phase B: ロック外で重い I/O (chunk 読み込み + temp file 書き込み + uploadTask 作成)
         let task: URLSessionUploadTask
         do {
-            task = try makeUploadTaskLocked(
+            task = try buildUploadTask(
                 session: ctx.session,
                 chunkIndex: chunkIndex,
                 earliestBeginDate: ctx.target
@@ -1259,51 +1274,57 @@ extension NetworkService {
             return
         }
 
-        // Phase C: 再度ロックを取り、taskId 登録 + 同期永続化
+        // Phase C: 再度ロックを取り、taskId 登録
         withState {
             activeTaskIds[ctx.session.id] = task.taskIdentifier
             taskStartTimes[ctx.session.id] = Date()
             uploadQueues[ctx.session.id]?.setProcessing(true)
-            UploadManager.shared.saveActiveStateSync()
         }
+        // Phase C.5: 同期永続化はロック外で (disk I/O をロック内から追い出す)
+        UploadManager.shared.saveActiveStateSync()
 
         // Phase D: ロック外で resume() — delegate の再入とロック競合を防ぐ
         task.resume()
     }
 
     /// withState 内から呼ばれる。上限到達時の状態遷移を単一化。
+    /// 同期永続化と error 通知は呼び出し側 (withState 外) で行う。
     private func onMaxRetriesExhaustedLocked(session: UploadSession, chunkIndex: Int) {
         AppLog.retry.error("❌ [MAX RETRIES] session=\(session.id) chunk=\(chunkIndex) 上限到達 → .error 遷移")
         session.chunkRetryCounts.removeValue(forKey: chunkIndex)
         session.chunkNextRetryAt.removeValue(forKey: chunkIndex)
         session.updateStatus(.error)
         cleanupTemporaryFile(sessionId: session.id, chunkIndex: chunkIndex)
-        UploadManager.shared.saveActiveStateSync()
+        // 永続化と通知はロック外で行う (disk I/O をロック内に閉じ込めない)。
+        let sessionId = session.id
         Task {
+            UploadManager.shared.saveActiveStateSync()
             await UploadManager.shared.notifyUploadError(
-                sessionId: session.id,
+                sessionId: sessionId,
                 error: NetworkError.fileError("チャンク\(chunkIndex)アップロード失敗: リトライ上限到達")
             )
         }
     }
 
     /// 新規 URLSessionUploadTask を作成し、earliestBeginDate を設定する。
-    /// withState 外からも呼べる (テスト用)。retry 経路以外では earliestBeginDate=nil で通常アップロード。
+    /// ロック非保持で呼べる (任意のコンテキストから安全)。retry 経路以外では
+    /// earliestBeginDate=nil で通常アップロード。
     func makeUploadTask(
         session: UploadSession,
         chunkIndex: Int,
         earliestBeginDate: Date? = nil
     ) throws -> URLSessionUploadTask {
-        // ロック保護外からの呼び出し用。実装は Locked と共通。
-        return try makeUploadTaskLocked(
+        return try buildUploadTask(
             session: session,
             chunkIndex: chunkIndex,
             earliestBeginDate: earliestBeginDate
         )
     }
 
-    /// withState 内で呼ぶ実体。tempURL 作成 + URLRequest + uploadTask + earliestBeginDate。
-    private func makeUploadTaskLocked(
+    /// tempURL 作成 + URLRequest + uploadTask + earliestBeginDate。
+    /// **ロックを取得/要求しない**: withState 内・外どちらから呼んでも安全。
+    /// 命名は「lock ownership を暗示しない」ように buildUploadTask とする。
+    private func buildUploadTask(
         session: UploadSession,
         chunkIndex: Int,
         earliestBeginDate: Date?
