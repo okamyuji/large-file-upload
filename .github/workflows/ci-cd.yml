@@ -98,10 +98,18 @@ jobs:
     
     - name: Build and Test
       run: |
+        # ランナー上で利用可能な最新の iPhone シミュレータを動的に選ぶ
+        DEST=$(xcrun simctl list devices available | awk '/^-- iOS/{iOS=$0; next} /iPhone/ && iOS!="" {print iOS, $0}' | tail -1)
+        SIM=$(echo "$DEST" | sed -n 's/.*\(iPhone [^(]*\) (.*/\1/p' | sed 's/ *$//')
+        OS=$(echo "$DEST" | sed -n 's/^-- iOS \([0-9.]*\).*/\1/p')
+        if [ -z "$SIM" ] || [ -z "$OS" ]; then
+          echo "iPhone シミュレータが見つかりません"; exit 1
+        fi
+        echo "使用シミュレータ: $SIM / iOS $OS"
         xcodebuild \
           -project LargeFileUpload.xcodeproj \
           -scheme LargeFileUpload \
-          -destination 'platform=iOS Simulator,name=iPhone 15,OS=17.2' \
+          -destination "platform=iOS Simulator,name=$SIM,OS=$OS" \
           -derivedDataPath DerivedData \
           clean test
     
