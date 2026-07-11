@@ -7,7 +7,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
     ) -> Bool {
-        print("📱 アプリケーションが起動しました")
+        AppLog.upload.notice("📱 アプリケーションが起動しました")
         
         // バックグラウンドタスクの設定
         setupBackgroundTasks()
@@ -25,7 +25,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         handleEventsForBackgroundURLSession identifier: String,
         completionHandler: @escaping () -> Void
     ) {
-        print("🔔 BackgroundURLSession イベント処理: \(identifier)")
+        AppLog.upload.notice("🔔 BackgroundURLSession イベント処理: \(identifier)")
         
         // NetworkServiceにcompletionHandlerを渡す
         NetworkService.shared.backgroundCompletionHandler = completionHandler
@@ -53,29 +53,35 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             }
         }
         
-        print("✅ バックグラウンドタスクの設定を完了しました")
+        AppLog.upload.notice("✅ バックグラウンドタスクの設定を完了しました")
     }
     
     @available(iOS 13.0, *)
     private func handleBackgroundUploadTask(task: BGProcessingTask) {
-        print("🔄 バックグラウンドアップロードタスク実行")
-        
-        // タスクの期限切れ処理
+        AppLog.upload.notice("🔄 バックグラウンドアップロードタスク実行")
+
+        var workTask: Task<Void, Never>?
+
+        // タスクの期限切れ処理: 進行中の Task をキャンセルしてから setTaskCompleted(false) を呼ぶ
         task.expirationHandler = {
-            print("⏰ バックグラウンドタスクが期限切れになりました")
+            AppLog.upload.notice("⏰ バックグラウンドタスクが期限切れになりました")
+            workTask?.cancel()
             task.setTaskCompleted(success: false)
         }
-        
-        // バックグラウンドでのアップロード処理
-        Task {
+
+        // バックグラウンドでのアップロード処理。Task ハンドルを保持し、
+        // 期限切れで cancel された場合は setTaskCompleted を呼ばない
+        // (BGProcessingTask.setTaskCompleted の二重呼び出しは未定義動作)。
+        workTask = Task {
             await NetworkService.shared.refreshAllSessionStatus()
+            guard !Task.isCancelled else { return }
             task.setTaskCompleted(success: true)
         }
     }
     
     @available(iOS 13.0, *)
     private func handleRefreshTask(task: BGAppRefreshTask) {
-        print("🔄 アプリリフレッシュタスク実行")
+        AppLog.upload.notice("🔄 アプリリフレッシュタスク実行")
         
         task.expirationHandler = {
             task.setTaskCompleted(success: false)
@@ -90,12 +96,12 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     // MARK: - App Lifecycle
     
     func applicationDidEnterBackground(_ application: UIApplication) {
-        print("🌙 アプリがバックグラウンドに移行しました")
+        AppLog.upload.notice("🌙 アプリがバックグラウンドに移行しました")
         scheduleBackgroundTasks()
     }
     
     func applicationWillEnterForeground(_ application: UIApplication) {
-        print("☀️ アプリがフォアグラウンドに復帰しました")
+        AppLog.upload.notice("☀️ アプリがフォアグラウンドに復帰しました")
         cancelBackgroundTasks()
     }
     
@@ -109,9 +115,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             
             do {
                 try BGTaskScheduler.shared.submit(uploadRequest)
-                print("📅 バックグラウンドアップロードタスクをスケジュールしました")
+                AppLog.upload.notice("📅 バックグラウンドアップロードタスクをスケジュールしました")
             } catch {
-                print("❌ バックグラウンドタスクのスケジュールに失敗: \(error)")
+                AppLog.upload.notice("❌ バックグラウンドタスクのスケジュールに失敗: \(error)")
             }
             
             // リフレッシュタスクもスケジュール
@@ -120,9 +126,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             
             do {
                 try BGTaskScheduler.shared.submit(refreshRequest)
-                print("📅 リフレッシュタスクをスケジュールしました")
+                AppLog.upload.notice("📅 リフレッシュタスクをスケジュールしました")
             } catch {
-                print("❌ リフレッシュタスクのスケジュールに失敗: \(error)")
+                AppLog.upload.notice("❌ リフレッシュタスクのスケジュールに失敗: \(error)")
             }
         }
     }
@@ -130,7 +136,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
     private func cancelBackgroundTasks() {
         if #available(iOS 13.0, *) {
             BGTaskScheduler.shared.cancelAllTaskRequests()
-            print("🚫 バックグラウンドタスクをキャンセルしました")
+            AppLog.upload.notice("🚫 バックグラウンドタスクをキャンセルしました")
         }
     }
     
@@ -141,9 +147,9 @@ class AppDelegate: NSObject, UIApplicationDelegate {
             options: [.alert, .badge, .sound]
         ) { granted, error in
             if granted {
-                print("✅ 通知許可が得られました")
+                AppLog.upload.notice("✅ 通知許可が得られました")
             } else if let error = error {
-                print("❌ 通知許可エラー: \(error)")
+                AppLog.upload.notice("❌ 通知許可エラー: \(error)")
             }
         }
     }

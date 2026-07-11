@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -14,6 +15,14 @@ import (
 	"large-file-upload-server/services"
 	"large-file-upload-server/utils"
 )
+
+// TestMain enforces that fault-injection env vars leaked from the developer's
+// shell or CI runner don't turn on 503 injection during tests.
+func TestMain(m *testing.M) {
+	_ = os.Unsetenv("LARGE_FILE_UPLOAD_FAULT_RATE")
+	_ = os.Unsetenv("LARGE_FILE_UPLOAD_FAULT_SEED")
+	os.Exit(m.Run())
+}
 
 func TestUploadWorkflow(t *testing.T) {
 	// テスト用のサービスとハンドラーを作成

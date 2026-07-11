@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"large-file-upload-server/handlers"
+	"large-file-upload-server/middleware"
 	"large-file-upload-server/services"
 	"large-file-upload-server/utils"
 )
@@ -76,10 +77,17 @@ func main() {
 		port = DefaultPort
 	}
 
+	// Fault-injection ミドルウェア (env フラグ off なら pass-through)
+	fi := middleware.NewFaultInjectionConfig()
+	if fi.Rate > 0 {
+		log.Printf("[FAULT INJECTION] enabled rate=%.2f statusCode=%d", fi.Rate, fi.StatusCode)
+	}
+	handler := fi.Handler(mux)
+
 	// サーバー設定
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      mux,
+		Handler:      handler,
 		ReadTimeout:  ReadTimeout,
 		WriteTimeout: WriteTimeout,
 		IdleTimeout:  IdleTimeout,

@@ -31,11 +31,33 @@ class FileManager: ObservableObject {
 
     // MARK: - Chunk Operations
 
-    func calculateChunkInfo(fileSize: Int64, targetChunkSize: Int = 1024 * 1024)
+    /// サーバ側のチャンクサイズ制約 (models/models.go の定数と同期): 1024 bytes 〜 10 MiB。
+    static let maxChunkSize: Int = 10 * 1024 * 1024
+    static let minChunkSize: Int = 1024
+
+    /// ファイルサイズ ≤ maxChunkSize なら 1 チャンク、それ以上は 128 チャンクを目標に adaptive。
+    /// 1MB floor, 10MB ceiling (server 制約) の範囲で決定する。
+    /// 1GB → 約 8 MB × 128 チャンク、実機の失敗確率と HTTP オーバーヘッドを抑える。
+    static func adaptiveChunkSize(for fileSize: Int64) -> Int {
+        if fileSize <= Int64(maxChunkSize) {
+            return max(minChunkSize, Int(max(1, fileSize)))
+        }
+        let targetChunks = Int64(128)
+        let ideal = Int((fileSize + targetChunks - 1) / targetChunks)
+        let softFloor = 1024 * 1024 // 1MB
+        return max(softFloor, min(maxChunkSize, ideal))
+    }
+
+    func calculateChunkInfo(fileSize: Int64, targetChunkSize: Int? = nil)
         -> (chunkSize: Int, totalChunks: Int)
     {
-        let chunkSize = min(targetChunkSize, Int(fileSize))
-        let totalChunks = Int(ceil(Double(fileSize) / Double(chunkSize)))
+        let requested = targetChunkSize ?? FileManager.adaptiveChunkSize(for: fileSize)
+        // ファイルサイズより大きくはしない、かつサーバ制約内にクランプ
+        let clamped = max(FileManager.minChunkSize, min(FileManager.maxChunkSize, requested))
+        let chunkSize = min(clamped, max(1, Int(fileSize)))
+        let totalChunks = fileSize > 0
+            ? Int(ceil(Double(fileSize) / Double(chunkSize)))
+            : 0
         return (chunkSize: chunkSize, totalChunks: totalChunks)
     }
 
@@ -110,7 +132,7 @@ class FileManager: ObservableObject {
             throw NetworkError.fileError("チャンク\(chunkIndex)のデータが空です")
         }
         
-        print("📖 [FILE] チャンク\(chunkIndex)読み込み成功: \(chunkData.count) bytes")
+        AppLog.upload.notice("📖 [FILE] チャンク\(chunkIndex)読み込み成功: \(chunkData.count) bytes")
         return chunkData
     }
 

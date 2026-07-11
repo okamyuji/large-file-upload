@@ -57,7 +57,7 @@ struct EmptyResponse: Codable {
 
 // MARK: - Upload Session Model
 
-class UploadSession: ObservableObject {
+class UploadSession: ObservableObject, Codable {
     let id: String
     let fileName: String
     let fileURL: URL
@@ -70,6 +70,10 @@ class UploadSession: ObservableObject {
     @Published var uploadedChunks: Set<Int> = []
     @Published var progress: Double = 0.0
     @Published var error: String?
+    /// チャンクごとのリトライ回数。永続化されアプリ再起動後も引き継がれる。
+    @Published var chunkRetryCounts: [Int: Int] = [:]
+    /// チャンクごとの次回リトライ予定時刻。earliestBeginDate で予約した OS 所有タスクの証跡。
+    @Published var chunkNextRetryAt: [Int: Date] = [:]
 
     var missingChunks: [Int] {
         let allChunks = Set(0..<totalChunks)
@@ -98,6 +102,60 @@ class UploadSession: ObservableObject {
         self.chunkSize = chunkSize
     }
 
+    // MARK: - Codable
+
+    private enum CodingKeys: String, CodingKey {
+        case id, fileName, fileURL, totalChunks, fileSize, fileChecksum, chunkSize
+        case status, uploadedChunks, progress, error, chunkRetryCounts, chunkNextRetryAt
+    }
+
+    required init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try c.decode(String.self, forKey: .id)
+        self.fileName = try c.decode(String.self, forKey: .fileName)
+        self.fileURL = try c.decode(URL.self, forKey: .fileURL)
+        self.totalChunks = try c.decode(Int.self, forKey: .totalChunks)
+        self.fileSize = try c.decode(Int64.self, forKey: .fileSize)
+        self.fileChecksum = try c.decode(String.self, forKey: .fileChecksum)
+        self.chunkSize = try c.decode(Int.self, forKey: .chunkSize)
+        self.status = try c.decodeIfPresent(UploadStatus.self, forKey: .status) ?? .created
+        self.uploadedChunks = try c.decodeIfPresent(Set<Int>.self, forKey: .uploadedChunks) ?? []
+        self.progress = try c.decodeIfPresent(Double.self, forKey: .progress) ?? 0.0
+        self.error = try c.decodeIfPresent(String.self, forKey: .error)
+        // JSON はキーが String のみなので [String:_] 経由で復元
+        if let raw = try c.decodeIfPresent([String: Int].self, forKey: .chunkRetryCounts) {
+            var mapped: [Int: Int] = [:]
+            for (k, v) in raw { if let idx = Int(k) { mapped[idx] = v } }
+            self.chunkRetryCounts = mapped
+        }
+        if let raw = try c.decodeIfPresent([String: Date].self, forKey: .chunkNextRetryAt) {
+            var mapped: [Int: Date] = [:]
+            for (k, v) in raw { if let idx = Int(k) { mapped[idx] = v } }
+            self.chunkNextRetryAt = mapped
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(fileName, forKey: .fileName)
+        try c.encode(fileURL, forKey: .fileURL)
+        try c.encode(totalChunks, forKey: .totalChunks)
+        try c.encode(fileSize, forKey: .fileSize)
+        try c.encode(fileChecksum, forKey: .fileChecksum)
+        try c.encode(chunkSize, forKey: .chunkSize)
+        try c.encode(status, forKey: .status)
+        try c.encode(uploadedChunks, forKey: .uploadedChunks)
+        try c.encode(progress, forKey: .progress)
+        try c.encodeIfPresent(error, forKey: .error)
+        let stringKeyedCounts = Dictionary(uniqueKeysWithValues: chunkRetryCounts.map { (String($0.key), $0.value) })
+        try c.encode(stringKeyedCounts, forKey: .chunkRetryCounts)
+        let stringKeyedDates = Dictionary(uniqueKeysWithValues: chunkNextRetryAt.map { (String($0.key), $0.value) })
+        try c.encode(stringKeyedDates, forKey: .chunkNextRetryAt)
+    }
+
+    // MARK: - Mutations
+
     func updateProgress() {
         progress =
             totalChunks > 0
@@ -125,7 +183,7 @@ class UploadSession: ObservableObject {
 
 // MARK: - Upload Status
 
-enum UploadStatus: String, CaseIterable {
+enum UploadStatus: String, CaseIterable, Codable {
     case created = "created"
     case uploading = "uploading"
     case ready = "ready"
@@ -178,7 +236,22 @@ enum APIEndpoint {
     case deleteSession(sessionId: String)
 
     private var baseURL: String {
-        return "http://192.168.0.16:8080"
+        // 環境変数 LARGE_FILE_UPLOAD_SERVER が優先。
+        // 未設定時: Simulator は 127.0.0.1、実機は Info.plist の LARGE_FILE_UPLOAD_SERVER キー
+        // (未設定なら 127.0.0.1 で fallback、実機接続時は環境か Info.plist で LAN IP を設定する)。
+        if let env = ProcessInfo.processInfo.environment["LARGE_FILE_UPLOAD_SERVER"], !env.isEmpty {
+            return env
+        }
+        if let plist = Bundle.main.object(forInfoDictionaryKey: "LARGE_FILE_UPLOAD_SERVER") as? String, !plist.isEmpty {
+            return plist
+        }
+        // Default fallback (シミュレータ / 実機共通): 127.0.0.1。
+        // 実機で LAN サーバに接続する場合は Info.plist に LARGE_FILE_UPLOAD_SERVER キー
+        // (例: "http://<mac-lan-ip>:8080") を追加するか、Xcode Scheme の環境変数で設定する。
+        // Xcode USB tunnel 経由 (WiFi 依存なし) で接続する場合は、
+        // `xcrun devicectl device info details --device <UDID>` の tunnelIPAddress の
+        // Mac 側 (fd00::/8 の ULA) を IPv6 URL 形式で指定できる。
+        return "http://127.0.0.1:8080"
     }
 
     var url: URL {
