@@ -27,7 +27,7 @@ struct LargeFileUploadApp: App {
     }
 
     private func setupApp() {
-        print("アプリ初期化開始")
+        AppLog.upload.notice("アプリ初期化開始")
 
         // 通知設定
         requestNotificationPermission()
@@ -35,7 +35,7 @@ struct LargeFileUploadApp: App {
         // 一時ファイルのクリーンアップ
         cleanupTemporaryFiles()
 
-        print("アプリ初期化完了")
+        AppLog.upload.notice("アプリ初期化完了")
     }
 
     private func requestNotificationPermission() {
@@ -44,11 +44,11 @@ struct LargeFileUploadApp: App {
         ]) { granted, error in
             DispatchQueue.main.async {
                 if granted {
-                    print("通知許可が得られました")
+                    AppLog.upload.notice("通知許可が得られました")
                 } else if let error = error {
-                    print("通知許可エラー: \(error)")
+                    AppLog.upload.notice("通知許可エラー: \(error)")
                 } else {
-                    print("通知許可が拒否されました")
+                    AppLog.upload.notice("通知許可が拒否されました")
                 }
             }
         }
@@ -81,12 +81,12 @@ struct LargeFileUploadApp: App {
                             try Foundation.FileManager.default.removeItem(
                                 at: file
                             )
-                            print("古い一時ファイルを削除: \(file.lastPathComponent)")
+                            AppLog.upload.notice("古い一時ファイルを削除: \(file.lastPathComponent)")
                         }
                     }
                 }
             } catch {
-                print("一時ファイルクリーンアップエラー: \(error)")
+                AppLog.upload.notice("一時ファイルクリーンアップエラー: \(error)")
             }
         }
     }

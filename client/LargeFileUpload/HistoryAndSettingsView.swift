@@ -376,7 +376,7 @@ struct SettingsView: View {
 
     private func clearCache() {
         // キャッシュクリアの実装
-        print("キャッシュをクリアしました")
+        AppLog.upload.notice("キャッシュをクリアしました")
     }
 
     private func cleanupTemporaryFiles() {
@@ -395,9 +395,9 @@ struct SettingsView: View {
                     try Foundation.FileManager.default.removeItem(at: file)
                 }
             }
-            print("一時ファイルをクリーンアップしました")
+            AppLog.upload.notice("一時ファイルをクリーンアップしました")
         } catch {
-            print("一時ファイルクリーンアップエラー: \(error)")
+            AppLog.upload.notice("一時ファイルクリーンアップエラー: \(error)")
         }
     }
 }

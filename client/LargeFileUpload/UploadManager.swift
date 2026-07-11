@@ -31,6 +31,10 @@ class UploadManager: ObservableObject {
     private init() {
         setupNotifications()
         loadUploadHistory()
+        // v2: 起動時に OS 所有タスクを reconcile
+        Task {
+            _ = await NetworkService.shared.reconcileOSOwnedTasks()
+        }
     }
 
     private func setupNotifications() {
@@ -58,16 +62,16 @@ class UploadManager: ObservableObject {
 
     @objc private func appDidEnterBackground() {
         isAppInBackground = true
-        print("🌙 アップロードマネージャー: アプリがバックグラウンドに移行 - MainActor使用停止")
+        AppLog.upload.notice("🌙 アップロードマネージャー: アプリがバックグラウンドに移行 - MainActor使用停止")
         // BackgroundURLSessionを使用しているため、UIApplication.beginBackgroundTaskは不要
-        print("🔗 [BACKGROUND SESSION] BackgroundURLSessionがアップロードを継続します")
+        AppLog.upload.notice("🔗 [BACKGROUND SESSION] BackgroundURLSessionがアップロードを継続します")
     }
 
     @objc private func appWillEnterForeground() {
         isAppInBackground = false
-        print("☀️ アップロードマネージャー: アプリがフォアグラウンドに復帰 - UI更新再開")
+        AppLog.upload.notice("☀️ アップロードマネージャー: アプリがフォアグラウンドに復帰 - UI更新再開")
         // BackgroundURLSessionを使用しているため、UIApplication.endBackgroundTaskは不要
-        print("🔗 [FOREGROUND RESUME] BackgroundURLSessionから状態同期を開始")
+        AppLog.upload.notice("🔗 [FOREGROUND RESUME] BackgroundURLSessionから状態同期を開始")
 
         // アクティブなアップロードの状態を更新（フォアグラウンド専用）
         Task {
@@ -76,7 +80,7 @@ class UploadManager: ObservableObject {
     }
 
     @objc private func appWillTerminate() {
-        print("アップロードマネージャー: アプリが終了")
+        AppLog.upload.notice("アップロードマネージャー: アプリが終了")
         saveUploadHistory()
     }
 
@@ -87,7 +91,7 @@ class UploadManager: ObservableObject {
         if isAppInBackground {
             // バックグラウンド時：MainActor使用禁止、直接更新
             updateBlock()
-            print("🌙 [BACKGROUND] UploadManager状態更新: MainActor回避")
+            AppLog.upload.notice("🌙 [BACKGROUND] UploadManager状態更新: MainActor回避")
         } else {
             // フォアグラウンド時：UI更新のためMainActor使用
             Task {
@@ -103,7 +107,7 @@ class UploadManager: ObservableObject {
         if isAppInBackground {
             // バックグラウンド時：直接更新のみ（UI更新不要）
             updateBlock(session)
-            print("🌙 [BACKGROUND] セッション更新: \(session.id)")
+            AppLog.upload.notice("🌙 [BACKGROUND] セッション更新: \(session.id)")
         } else {
             // フォアグラウンド時：UI更新も含める
             updateBlock(session)
@@ -135,7 +139,7 @@ class UploadManager: ObservableObject {
 
         for session in failedSessions {
             do {
-                print("🔄 失敗アップロードの再試行: \(session.fileName)")
+                AppLog.upload.notice("🔄 失敗アップロードの再試行: \(session.fileName)")
                 
                 // 逐次処理でアップロード再開
                 try await networkService.startUpload(session: session)
@@ -148,9 +152,9 @@ class UploadManager: ObservableObject {
                     self.updateUploadingStatus()
                 }
                 
-                print("✅ 逐次処理アップロード再開成功: \(session.fileName)")
+                AppLog.upload.notice("✅ 逐次処理アップロード再開成功: \(session.fileName)")
             } catch {
-                print("❌ 再試行エラー (\(session.fileName)): \(error)")
+                AppLog.upload.notice("❌ 再試行エラー (\(session.fileName)): \(error)")
                 await handleUploadErrorSafely(session: session, error: error)
             }
         }
@@ -159,13 +163,21 @@ class UploadManager: ObservableObject {
     private func refreshActiveUploads() async {
         // フォアグラウンド専用メソッド（MainActor安全）
         guard !isAppInBackground else {
-            print("🌙 [BACKGROUND] refreshActiveUploads スキップ - バックグラウンド時はUI更新不要")
+            AppLog.upload.notice("🌙 [BACKGROUND] refreshActiveUploads スキップ - バックグラウンド時はUI更新不要")
             return
         }
-        
-        // NetworkServiceの逐次処理システムでは自動的に状態更新される
+
+        // 復元された active session をサーバ状態と同期して未送信チャンクの送信を再開
+        for (_, session) in activeUploads where session.status != .completed && session.status != .error {
+            do {
+                try await networkService.resumeSessionFromServer(session)
+            } catch {
+                AppLog.upload.error("resume 失敗 (\(session.fileName)): \(error.localizedDescription)")
+            }
+        }
+
         await networkService.refreshAllSessionStatus()
-        
+
         await MainActor.run {
             self.updateUploadingStatus()
         }
@@ -192,7 +204,7 @@ class UploadManager: ObservableObject {
     // MARK: - Upload Management (バックグラウンド安全)
 
     func startUpload(fileURL: URL) async throws -> UploadSession {
-        print("🚀 アップロード開始: \(fileURL.lastPathComponent)")
+        AppLog.upload.notice("🚀 アップロード開始: \(fileURL.lastPathComponent)")
 
         // ファイル検証
         try fileManager.validateFileForUpload(url: fileURL)
@@ -211,7 +223,7 @@ class UploadManager: ObservableObject {
         // BackgroundURLSessionでアップロード開始
         try await networkService.startUpload(session: session)
         
-        print("✅ BackgroundURLSessionアップロード開始: \(session.fileName)")
+        AppLog.upload.notice("✅ BackgroundURLSessionアップロード開始: \(session.fileName)")
         return session
     }
 
@@ -221,7 +233,7 @@ class UploadManager: ObservableObject {
         updateSessionSafely(session) { session in
             session.updateStatus(.paused)
         }
-        print("アップロード一時停止: \(session.fileName)")
+        AppLog.upload.notice("アップロード一時停止: \(session.fileName)")
     }
 
     func resumeUpload(sessionId: String) async throws {
@@ -230,13 +242,13 @@ class UploadManager: ObservableObject {
         updateSessionSafely(session) { session in
             session.updateStatus(.uploading)
         }
-        print("🔄 アップロード再開: \(session.fileName)")
+        AppLog.upload.notice("🔄 アップロード再開: \(session.fileName)")
 
         Task {
             do {
                 // BackgroundURLSessionでアップロード再開
                 try await networkService.startUpload(session: session)
-                print("✅ BackgroundURLSessionアップロード再開成功: \(session.fileName)")
+                AppLog.upload.notice("✅ BackgroundURLSessionアップロード再開成功: \(session.fileName)")
             } catch {
                 await handleUploadErrorSafely(session: session, error: error)
             }
@@ -246,12 +258,12 @@ class UploadManager: ObservableObject {
     func cancelUpload(sessionId: String) async {
         guard let session = activeUploads[sessionId] else { return }
 
-        print("アップロードキャンセル: \(session.fileName)")
+        AppLog.upload.notice("アップロードキャンセル: \(session.fileName)")
 
         do {
             try await networkService.deleteSession(sessionId: sessionId)
         } catch {
-            print("セッション削除エラー: \(error)")
+            AppLog.upload.notice("セッション削除エラー: \(error)")
         }
 
         updateStateSafely {
@@ -267,14 +279,14 @@ class UploadManager: ObservableObject {
             session.setError(error.localizedDescription)
         }
         
-        print("❌ [BACKGROUND SAFE] アップロードエラー (\(session.fileName)): \(error)")
+        AppLog.upload.notice("❌ [BACKGROUND SAFE] アップロードエラー (\(session.fileName)): \(error)")
         
         // 通知はバックグラウンドでも実行可能
         showErrorNotification(session: session, error: error)
     }
 
     func handleUploadCompletion(session: UploadSession) {
-        print("🎉 [UPLOAD MANAGER] アップロード完了: \(session.fileName)")
+        AppLog.upload.notice("🎉 [UPLOAD MANAGER] アップロード完了: \(session.fileName)")
         
         updateSessionSafely(session) { session in
             session.updateStatus(.completed)
@@ -306,7 +318,7 @@ class UploadManager: ObservableObject {
     // MARK: - Batch Operations
 
     func startMultipleUploads(fileURLs: [URL]) async {
-        print("バッチアップロード開始: \(fileURLs.count) ファイル")
+        AppLog.upload.notice("バッチアップロード開始: \(fileURLs.count) ファイル")
 
         await withTaskGroup(of: Void.self) { group in
             for fileURL in fileURLs {
@@ -314,7 +326,7 @@ class UploadManager: ObservableObject {
                     do {
                         _ = try await self.startUpload(fileURL: fileURL)
                     } catch {
-                        print(
+                        AppLog.upload.notice(
                             "ファイルアップロード失敗 (\(fileURL.lastPathComponent)): \(error)"
                         )
                     }
@@ -336,54 +348,54 @@ class UploadManager: ObservableObject {
 
     // MARK: - Persistence
 
+    // MARK: - Persistence (Codable)
+
+    private struct PersistedState: Codable {
+        let history: [UploadSession]
+        let active: [UploadSession]
+    }
+
+    private func stateFileURL() -> URL {
+        return fileManager.getDocumentsDirectory()
+            .appendingPathComponent("upload_state.json")
+    }
+
+    /// 同期永続化。NetworkService の withState 内から呼ばれるため public。
+    func saveActiveStateSync() {
+        saveUploadHistory()
+    }
+
     private func saveUploadHistory() {
         do {
-            let documentsDir = fileManager.getDocumentsDirectory()
-            let historyURL = documentsDir.appendingPathComponent(
-                "upload_history.json"
+            let state = PersistedState(
+                history: uploadHistory,
+                active: Array(activeUploads.values)
             )
-
-            // 簡易的な保存（実際のアプリではより堅牢な方法を使用）
-            let historyData = uploadHistory.map { session in
-                [
-                    "id": session.id,
-                    "fileName": session.fileName,
-                    "fileSize": session.fileSize,
-                    "status": session.status.rawValue,
-                    "progress": session.progress,
-                    "error": session.error ?? "",
-                ]
-            }
-
-            let data = try JSONSerialization.data(withJSONObject: historyData)
-            try data.write(to: historyURL)
+            let encoder = JSONEncoder()
+            let data = try encoder.encode(state)
+            try data.write(to: stateFileURL())
         } catch {
-            print("アップロード履歴保存エラー: \(error)")
+            AppLog.upload.error("状態保存エラー: \(error.localizedDescription)")
         }
     }
 
     private func loadUploadHistory() {
+        let url = stateFileURL()
+        guard Foundation.FileManager.default.fileExists(atPath: url.path) else { return }
         do {
-            let documentsDir = fileManager.getDocumentsDirectory()
-            let historyURL = documentsDir.appendingPathComponent(
-                "upload_history.json"
-            )
-
-            guard
-                Foundation.FileManager.default.fileExists(
-                    atPath: historyURL.path
-                )
-            else { return }
-
-            let data = try Data(contentsOf: historyURL)
-            let historyData =
-                try JSONSerialization.jsonObject(with: data) as? [[String: Any]]
-                ?? []
-
-            // 履歴復元（簡易版）
-            print("アップロード履歴を復元しました: \(historyData.count) 件")
+            let data = try Data(contentsOf: url)
+            let state = try JSONDecoder().decode(PersistedState.self, from: data)
+            self.uploadHistory = state.history
+            for s in state.active {
+                self.activeUploads[s.id] = s
+                // FLAW 5 対策: NetworkService 側にも同じ参照を登録して session identity を統一する。
+                // これで scheduleChunkRetry が触る activeUploadSessions[id] と UploadManager.activeUploads[id]
+                // が同一インスタンスを指し、永続化の内容が最新の retry state を反映する。
+                NetworkService.shared.activeUploadSessions[s.id] = s
+            }
+            AppLog.upload.notice("状態を復元しました: history=\(state.history.count) active=\(state.active.count)")
         } catch {
-            print("アップロード履歴読み込みエラー: \(error)")
+            AppLog.upload.error("状態読み込みエラー: \(error.localizedDescription)")
         }
     }
 
@@ -402,7 +414,7 @@ class UploadManager: ObservableObject {
         )
 
         UNUserNotificationCenter.current().add(request)
-        print("📱 [BACKGROUND SAFE] 完了通知送信: \(session.fileName)")
+        AppLog.upload.notice("📱 [BACKGROUND SAFE] 完了通知送信: \(session.fileName)")
     }
 
     private func showErrorNotification(session: UploadSession, error: Error) {
@@ -418,7 +430,7 @@ class UploadManager: ObservableObject {
         )
 
         UNUserNotificationCenter.current().add(request)
-        print("📱 [BACKGROUND SAFE] エラー通知送信: \(session.fileName)")
+        AppLog.upload.notice("📱 [BACKGROUND SAFE] エラー通知送信: \(session.fileName)")
     }
 
     // MARK: - Cleanup
@@ -450,19 +462,19 @@ extension UploadManager {
 
     // デバッグ用のメソッド
     func printDebugInfo() {
-        print("=== Upload Manager Debug Info ===")
-        print("Active uploads: \(activeUploads.count)")
-        print("Upload history: \(uploadHistory.count)")
-        print("Is uploading: \(isUploading)")
-        print("Background session: BackgroundURLSessionでアップロード継続中")
-        print("App in background: \(isAppInBackground)")
+        AppLog.upload.notice("=== Upload Manager Debug Info ===")
+        AppLog.upload.notice("Active uploads: \(self.activeUploads.count)")
+        AppLog.upload.notice("Upload history: \(self.uploadHistory.count)")
+        AppLog.upload.notice("Is uploading: \(self.isUploading)")
+        AppLog.upload.notice("Background session: BackgroundURLSessionでアップロード継続中")
+        AppLog.upload.notice("App in background: \(self.isAppInBackground)")
 
         for (sessionId, session) in activeUploads {
-            print(
+            AppLog.upload.notice(
                 "  Session \(sessionId): \(session.fileName) - \(session.status.description) (\(Int(session.progress * 100))%)"
             )
         }
-        print("================================")
+        AppLog.upload.notice("================================")
     }
 
     // 統計情報の文字列表現
@@ -486,7 +498,7 @@ extension UploadManager {
     // NetworkServiceからの完了通知を受け取る
     func notifyUploadCompletion(sessionId: String) {
         guard let session = activeUploads[sessionId] else {
-            print("⚠️ 完了通知: セッション \(sessionId) が見つかりません")
+            AppLog.upload.notice("⚠️ 完了通知: セッション \(sessionId) が見つかりません")
             return
         }
         
@@ -496,7 +508,7 @@ extension UploadManager {
     // NetworkServiceからのエラー通知を受け取る
     func notifyUploadError(sessionId: String, error: Error) async {
         guard let session = activeUploads[sessionId] else {
-            print("⚠️ エラー通知: セッション \(sessionId) が見つかりません")
+            AppLog.upload.notice("⚠️ エラー通知: セッション \(sessionId) が見つかりません")
             return
         }
         

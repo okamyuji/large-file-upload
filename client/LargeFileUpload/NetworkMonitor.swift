@@ -78,13 +78,13 @@ class NetworkMonitor: ObservableObject {
         }
         monitor.start(queue: queue)
 
-        print("ネットワーク監視を開始しました")
+        AppLog.upload.notice("ネットワーク監視を開始しました")
     }
 
     /// ネットワーク監視を停止
     func stopMonitoring() {
         monitor.cancel()
-        print("ネットワーク監視を停止しました")
+        AppLog.upload.notice("ネットワーク監視を停止しました")
     }
     
     // MARK: - Callback Management
@@ -135,17 +135,17 @@ class NetworkMonitor: ObservableObject {
         // 接続状態変化時のログと処理
         if previousConnectedState != isConnected {
             if isConnected {
-                print("📶 [NETWORK] ネットワーク接続が回復しました: \(connectionType.displayName)")
+                AppLog.upload.notice("📶 [NETWORK] ネットワーク接続が回復しました: \(self.connectionType.displayName)")
                 // 接続復旧時のコールバック実行
                 connectionRecoveryCallbacks.forEach { $0() }
             } else {
-                print("📵 [NETWORK] ネットワーク接続が失われました")
+                AppLog.upload.notice("📵 [NETWORK] ネットワーク接続が失われました")
             }
         }
         
         // 接続タイプ変更時の処理（WiFi ⇄ Cellular切り替え）
         if previousConnectionType.displayName != connectionType.displayName && isConnected {
-            print("🔄 [NETWORK] 接続タイプが変更されました: \(previousConnectionType.displayName) → \(connectionType.displayName)")
+            AppLog.upload.notice("🔄 [NETWORK] 接続タイプが変更されました: \(previousConnectionType.displayName) → \(self.connectionType.displayName)")
             // ネットワーク変更時のコールバック実行
             networkChangeCallbacks.forEach { $0(previousConnectionType, connectionType) }
         }
@@ -170,14 +170,14 @@ class NetworkMonitor: ObservableObject {
 
     private func logConnectionQuality() {
         let quality = getConnectionQuality()
-        print("接続品質: \(quality.displayName)")
+        AppLog.upload.notice("接続品質: \(quality.displayName)")
 
         if isExpensive {
-            print("⚠️ 従量制接続が検出されました")
+            AppLog.upload.notice("⚠️ 従量制接続が検出されました")
         }
 
         if isConstrained {
-            print("⚠️ 制限された接続が検出されました")
+            AppLog.upload.notice("⚠️ 制限された接続が検出されました")
         }
     }
 

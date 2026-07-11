@@ -73,7 +73,7 @@ struct ContentView: View {
     }
 
     private func setupApp() {
-        print("ContentView初期化完了")
+        AppLog.upload.notice("ContentView初期化完了")
     }
 
     private func handleSelectedFiles(_ urls: [URL]) {
@@ -95,7 +95,7 @@ struct ContentView: View {
             do {
                 // ファイル情報を先に取得して検証
                 let fileInfo = try FileManager.shared.getFileInfo(url: fileURL)
-                print("ファイル情報: \(fileInfo.name), \(fileInfo.size) bytes")
+                AppLog.upload.notice("ファイル情報: \(fileInfo.name), \(fileInfo.size) bytes")
 
                 // UploadManager経由でBackgroundURLSessionアップロード開始
                 let session = try await uploadManager.startUpload(fileURL: fileURL)
@@ -109,14 +109,14 @@ struct ContentView: View {
                     self.alertMessage = "\(error.localizedDescription)"
                     self.showingAlert = true
                 }
-                print("アップロードエラー: \(error)")
+                AppLog.upload.notice("アップロードエラー: \(error)")
             } catch {
                 DispatchQueue.main.async {
                     self.alertMessage =
                         "アップロード開始エラー: \(error.localizedDescription)"
                     self.showingAlert = true
                 }
-                print("予期しないエラー: \(error)")
+                AppLog.upload.notice("予期しないエラー: \(error)")
             }
 
             // セキュリティスコープ付きリソースへのアクセスを終了
@@ -394,9 +394,9 @@ struct DocumentPicker: UIViewControllerRepresentable {
             for url in urls {
                 if url.startAccessingSecurityScopedResource() {
                     accessibleURLs.append(url)
-                    print("ファイルアクセス許可取得: \(url.lastPathComponent)")
+                    AppLog.upload.notice("ファイルアクセス許可取得: \(url.lastPathComponent)")
                 } else {
-                    print("ファイルアクセス許可取得失敗: \(url.lastPathComponent)")
+                    AppLog.upload.notice("ファイルアクセス許可取得失敗: \(url.lastPathComponent)")
                 }
             }
 
@@ -406,7 +406,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
         func documentPickerWasCancelled(
             _ controller: UIDocumentPickerViewController
         ) {
-            print("ドキュメントピッカーがキャンセルされました")
+            AppLog.upload.notice("ドキュメントピッカーがキャンセルされました")
         }
     }
 }
