@@ -243,6 +243,28 @@ func EnableCORS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// uploadsRoot チャンク・ロックファイルを保存するルートディレクトリ
+const uploadsRoot = "uploads"
+
+// sessionIDPattern セッションIDとして許可する文字集合。
+// GenerateSessionID が生成する "session_<unix>_<hex>" を包含しつつ、
+// パス区切り文字や ".." を構成できない文字のみに制限する。
+var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+
+// SafeSessionFilePath uploads/<sessionID>/<fileName> のパスを検証付きで組み立てる。
+// sessionID はURL由来の入力なので、形式検証に加えて解決後のパスが
+// uploadsルート配下に収まることを確認する (path injection対策)。
+func SafeSessionFilePath(sessionID, fileName string) (string, error) {
+	if !sessionIDPattern.MatchString(sessionID) {
+		return "", fmt.Errorf("不正なセッションID形式: %q", sessionID)
+	}
+	cleaned := filepath.Clean(filepath.Join(uploadsRoot, sessionID, fileName))
+	if !strings.HasPrefix(cleaned, uploadsRoot+string(os.PathSeparator)) {
+		return "", fmt.Errorf("パスがアップロードディレクトリ外を指しています: %q", cleaned)
+	}
+	return cleaned, nil
+}
+
 // ChunkLock チャンクレベルのロック管理
 type ChunkLock struct {
 	LockFile *os.File
@@ -252,8 +274,11 @@ type ChunkLock struct {
 // AcquireChunkLock チャンクの排他ロックを取得
 func AcquireChunkLock(sessionID string, chunkIndex int, timeout time.Duration) (*ChunkLock, error) {
 	lockFileName := fmt.Sprintf("chunk_%d.lock", chunkIndex)
-	lockFilePath := filepath.Join("uploads", sessionID, lockFileName)
-	
+	lockFilePath, err := SafeSessionFilePath(sessionID, lockFileName)
+	if err != nil {
+		return nil, fmt.Errorf("ロックファイルパス検証エラー: %w", err)
+	}
+
 	// ロックファイルの作成または開く
 	lockFile, err := os.OpenFile(lockFilePath, os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
@@ -288,27 +313,27 @@ func (cl *ChunkLock) Release() error {
 	if cl.LockFile == nil {
 		return nil
 	}
-	
+
 	// ロック解放
 	err := syscall.Flock(int(cl.LockFile.Fd()), syscall.LOCK_UN)
 	if err != nil {
 		_ = cl.LockFile.Close()
 		return fmt.Errorf("ロック解放エラー: %w", err)
 	}
-	
+
 	// ファイルクローズ
 	closeErr := cl.LockFile.Close()
-	
+
 	// ロックファイル削除
 	removeErr := os.Remove(cl.FilePath)
-	
+
 	if closeErr != nil {
 		return fmt.Errorf("ロックファイルクローズエラー: %w", closeErr)
 	}
 	if removeErr != nil && !os.IsNotExist(removeErr) {
 		return fmt.Errorf("ロックファイル削除エラー: %w", removeErr)
 	}
-	
+
 	return nil
 }
 
@@ -316,33 +341,33 @@ func (cl *ChunkLock) Release() error {
 func AtomicChunkWrite(filePath string, data []byte) error {
 	// 一時ファイルパスを生成
 	tempFilePath := filePath + ".tmp." + generateRandomString(8)
-	
+
 	// 一時ファイルに書き込み
 	tempFile, err := os.Create(tempFilePath)
 	if err != nil {
 		return fmt.Errorf("一時ファイル作成エラー: %w", err)
 	}
-	
+
 	// データ書き込み
 	_, writeErr := tempFile.Write(data)
 	closeErr := tempFile.Close()
-	
+
 	if writeErr != nil {
 		_ = os.Remove(tempFilePath) // クリーンアップ
 		return fmt.Errorf("一時ファイル書き込みエラー: %w", writeErr)
 	}
-	
+
 	if closeErr != nil {
 		_ = os.Remove(tempFilePath) // クリーンアップ
 		return fmt.Errorf("一時ファイルクローズエラー: %w", closeErr)
 	}
-	
+
 	// 一時ファイルを最終ファイルに原子的に移動
 	if err := os.Rename(tempFilePath, filePath); err != nil {
 		_ = os.Remove(tempFilePath) // クリーンアップ
 		return fmt.Errorf("ファイル移動エラー: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -356,9 +381,12 @@ func generateRandomString(length int) string {
 // CheckChunkExists チャンクファイルの存在確認
 func CheckChunkExists(sessionID string, chunkIndex int) (bool, error) {
 	chunkFileName := fmt.Sprintf("chunk_%d.dat", chunkIndex)
-	chunkFilePath := filepath.Join("uploads", sessionID, chunkFileName)
-	
-	_, err := os.Stat(chunkFilePath)
+	chunkFilePath, err := SafeSessionFilePath(sessionID, chunkFileName)
+	if err != nil {
+		return false, fmt.Errorf("チャンクファイルパス検証エラー: %w", err)
+	}
+
+	_, err = os.Stat(chunkFilePath)
 	if err == nil {
 		return true, nil
 	}
