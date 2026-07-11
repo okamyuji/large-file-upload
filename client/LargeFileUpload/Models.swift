@@ -191,16 +191,21 @@ enum UploadStatus: String, CaseIterable, Codable {
     case completed = "completed"
     case error = "error"
     case paused = "paused"
+    // ユーザーが能動的に停止したことを示す終端 status。history 内で「エラー」とは区別する。
+    case cancelled = "cancelled"
 
     var description: String {
         switch self {
-        case .created: return "作成済み"
+        // .created / .ready はサーバ確立直後や送信キューへの積み込み中で、
+        // ユーザー体感としては送信開始と区別できないため「アップロード中」に統一する。
+        case .created: return "アップロード中"
         case .uploading: return "アップロード中"
-        case .ready: return "完了準備中"
+        case .ready: return "アップロード中"
         case .completing: return "完了処理中"
         case .completed: return "完了"
         case .error: return "エラー"
         case .paused: return "一時停止"
+        case .cancelled: return "キャンセル"
         }
     }
 
@@ -213,6 +218,7 @@ enum UploadStatus: String, CaseIterable, Codable {
         case .completed: return "green"
         case .error: return "red"
         case .paused: return "gray"
+        case .cancelled: return "gray"
         }
     }
 }

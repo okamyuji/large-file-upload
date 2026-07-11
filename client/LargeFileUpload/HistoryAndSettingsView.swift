@@ -76,15 +76,14 @@ struct HistoryView: View {
     }
 
     private func deleteHistoryItems(offsets: IndexSet) {
-        // 実際の実装では、選択されたアイテムを削除する
         for index in offsets {
             let session = filteredHistory[index]
-            uploadManager.uploadHistory.removeAll { $0.id == session.id }
+            uploadManager.deleteHistoryEntry(sessionId: session.id)
         }
     }
 
     private func clearHistory() {
-        uploadManager.uploadHistory.removeAll()
+        uploadManager.clearAllHistory()
     }
 }
 
@@ -207,24 +206,32 @@ struct HistoryRow: View {
             Spacer()
 
             // アクションメニュー
+            // List 行内の Menu は List 自身のタップ (行選択・swipe) にヒットが吸われて
+            // 開かないことがある。tap 範囲を ellipsis 画像だけに限定する contentShape と、
+            // 行選択と干渉しない BorderlessButtonStyle をあわせて指定する。
             Menu {
                 if session.status == .completed {
                     Button("詳細を表示") {
-                        // 詳細表示の実装
+                        // 詳細表示の実装は未着手
                     }
                 } else if session.status == .error {
                     Button("再試行") {
-                        // 再試行の実装
+                        // 再試行の実装は未着手
                     }
                 }
 
                 Button("履歴から削除", role: .destructive) {
-                    // 削除の実装
+                    UploadManager.shared.deleteHistoryEntry(sessionId: session.id)
                 }
             } label: {
                 Image(systemName: "ellipsis")
+                    .font(.title3)
                     .foregroundColor(.gray)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(BorderlessButtonStyle())
         }
         .padding(.vertical, 4)
     }
@@ -330,7 +337,7 @@ struct SettingsView: View {
                 // ストレージと履歴
                 Section {
                     Button("アップロード履歴をクリア") {
-                        UploadManager.shared.uploadHistory.removeAll()
+                        UploadManager.shared.clearAllHistory()
                     }
 
                     Button("キャッシュをクリア") {

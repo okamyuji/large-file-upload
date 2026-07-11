@@ -136,6 +136,54 @@ class FileManager: ObservableObject {
         return chunkData
     }
 
+    // MARK: - Persistent Upload Staging
+
+    /// アップロード対象のソースファイルをアプリ所有の Documents/uploads/ にコピーして返す。
+    ///
+    /// なぜ必要か:
+    /// - Document Picker から受け取る URL はセキュリティスコープ付きで、`startAccessingSecurityScopedResource`
+    ///   の有効期間はアプリの当該実行中のみ。Force Quit → 再起動後は scope が失われ、
+    ///   `session.fileURL` を直接読もうとしても失敗する (Resume 経路で PUT が飛ばない根本原因)。
+    /// - `temporaryDirectory` は iOS がストレージ逼迫時に purge する可能性があるので不適。
+    /// - Documents/ は同一 bundleID のアプリで永続、reinstall でも通常保持される。
+    ///
+    /// 戻り値: アプリ所有のコピー先 URL。以降 UploadSession はこの URL を保持する。
+    func stageFileForUpload(sourceURL: URL, sessionId: String) throws -> URL {
+        let uploadsDir = getDocumentsDirectory().appendingPathComponent("uploads", isDirectory: true)
+        if !Foundation.FileManager.default.fileExists(atPath: uploadsDir.path) {
+            try Foundation.FileManager.default.createDirectory(
+                at: uploadsDir,
+                withIntermediateDirectories: true,
+                attributes: nil
+            )
+        }
+        let ext = sourceURL.pathExtension
+        let destName = ext.isEmpty ? sessionId : "\(sessionId).\(ext)"
+        let destURL = uploadsDir.appendingPathComponent(destName)
+
+        // 既に存在する場合 (再送 or Force Quit 後の再作成) は上書き前提で削除
+        if Foundation.FileManager.default.fileExists(atPath: destURL.path) {
+            try? Foundation.FileManager.default.removeItem(at: destURL)
+        }
+        try Foundation.FileManager.default.copyItem(at: sourceURL, to: destURL)
+        try Foundation.FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.none],
+            ofItemAtPath: destURL.path
+        )
+        AppLog.upload.notice("📥 [STAGE] コピー完了: \(sourceURL.lastPathComponent) → \(destURL.path)")
+        return destURL
+    }
+
+    /// stageFileForUpload で作ったコピーを削除する。complete / discard / delete 経路で呼ぶ。
+    func cleanupStagedFile(sessionId: String, fileURL: URL) {
+        let uploadsDir = getDocumentsDirectory().appendingPathComponent("uploads", isDirectory: true)
+        // fileURL が uploads/ 配下にあれば削除。ユーザーが選んだ元ファイルは絶対に触らない。
+        if fileURL.path.hasPrefix(uploadsDir.path) {
+            try? Foundation.FileManager.default.removeItem(at: fileURL)
+            AppLog.upload.notice("🗑 [STAGE] コピー削除: session=\(sessionId)")
+        }
+    }
+
     // MARK: - Temporary File Management
 
     func createTemporaryFile(from sourceURL: URL) throws -> URL {
