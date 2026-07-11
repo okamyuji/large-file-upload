@@ -8,6 +8,7 @@ import Foundation
 /// この suite は「進行中に出てくるが再開が効かない」バグへの回帰テスト。
 /// 実サーバに依存する部分 (resumeSessionFromServer の HTTP 呼び出し) は
 /// PauseResumeIntegrationTests.swift で扱い、ここではローカル状態のみを対象にする。
+extension SerializedSingletonTests {
 @Suite(.serialized)
 struct PauseResumeTests {
 
@@ -108,4 +109,5 @@ struct PauseResumeTests {
         #expect(s.uploadedChunks == Set([0, 1, 2, 4, 5, 6, 8]))
         #expect(s.progress == 0.7)
     }
+}
 }

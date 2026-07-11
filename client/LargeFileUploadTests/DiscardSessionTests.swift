@@ -8,6 +8,7 @@ import Foundation
 /// - uploadHistory に error status で追加
 /// - 永続化される
 /// ことを検証する。
+extension SerializedSingletonTests {
 @Suite(.serialized)
 struct DiscardSessionTests {
 
@@ -70,4 +71,5 @@ struct DiscardSessionTests {
         #expect(activeCount == 0)
         #expect(historyCount == 0)
     }
+}
 }

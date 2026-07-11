@@ -61,6 +61,7 @@ struct StateLabelMappingTests {
 /// キャンセル操作が「痕跡ゼロで消える」のを防ぐ回帰テスト。
 /// UploadManager.cancelUpload は activeUploads から削除するだけでなく
 /// history に .cancelled として insert し、ディスクにも反映すること。
+extension SerializedSingletonTests {
 @Suite(.serialized)
 struct CancelHistoryTraceTests {
 
@@ -104,4 +105,5 @@ struct CancelHistoryTraceTests {
         #expect(historyCount == 1)
         #expect(firstStatus == .cancelled)
     }
+}
 }

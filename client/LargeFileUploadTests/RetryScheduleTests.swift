@@ -7,6 +7,7 @@ import Foundation
 /// 実サーバや実 URLSession に依存せず、in-memory session の state 更新のみを検証する。
 /// makeUploadTask 実体テストは EarliestBeginDateTests に分離。
 /// NetworkService.shared を共有するため直列実行 (.serialized)。
+extension SerializedSingletonTests {
 @Suite(.serialized)
 struct RetryScheduleTests {
 
@@ -142,4 +143,5 @@ struct RetryScheduleTests {
 
         ns.activeUploadSessions.removeValue(forKey: session.id)
     }
+}
 }

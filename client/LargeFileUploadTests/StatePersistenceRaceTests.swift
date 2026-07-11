@@ -10,6 +10,7 @@ import Foundation
 ///   cleanup / cancelUpload の直後に upload_state.json を読み戻すと変更が反映されている
 /// - Force Quit をシミュレート (プロセス再起動なしに新しい UploadManager を作るのは
 ///   singleton 都合で不可能なため、ファイルの内容そのものを assert する)
+extension SerializedSingletonTests {
 @Suite(.serialized)
 struct StatePersistenceRaceTests {
 
@@ -164,4 +165,5 @@ struct StatePersistenceRaceTests {
         let snap = readState()
         #expect(snap?.active.contains(where: { $0.id == s.id }) == true)
     }
+}
 }

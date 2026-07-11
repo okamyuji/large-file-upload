@@ -4,8 +4,10 @@ import Foundation
 @testable import LargeFileUpload
 
 /// 実サーバに対して行うシミュレータ内実通信テスト。
-/// 明示的に `-only-testing:LargeFileUploadTests/RealUploadIntegrationTests` を指定した時にのみ実行する。
+/// 明示的に `-only-testing:LargeFileUploadTests/SerializedSingletonTests/RealUploadIntegrationTests`
+/// を指定した時にのみ実行する。
 /// (通常の全件テストランは重すぎるため -skip-testing する運用を想定)
+extension SerializedSingletonTests {
 struct RealUploadIntegrationTests {
 
     private var serverURL: String {
@@ -104,4 +106,5 @@ struct RealUploadIntegrationTests {
         let totalRetries = session.chunkRetryCounts.values.reduce(0, +)
         AppLog.upload.notice("[TEST] fault-injection: total retries observed = \(totalRetries)")
     }
+}
 }
