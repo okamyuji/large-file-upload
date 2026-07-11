@@ -235,8 +235,13 @@ class UploadManager: ObservableObject {
     func pauseUpload(sessionId: String) {
         guard let session = activeUploads[sessionId] else { return }
 
-        updateSessionSafely(session) { session in
+        // Bug 対策: .paused を必ずディスクにも反映する。以前は updateSessionSafely だけで
+        // save が呼ばれず、Force Quit 後に古い .uploading 状態が復元 → 起動時 reconcile が
+        // 「まだ送信中」と判断して自動再開してしまい、ユーザーの pause が無視されていた。
+        performStateMutationAndPersist { [weak self] in
+            guard let self = self else { return }
             session.updateStatus(.paused)
+            self.updateUploadingStatus()
         }
         // BackgroundURLSession の OS 側 in-flight タスクも停止して、pause 後も
         // 裏で PUT が続くのを防ぐ。cancel された分は resumeSessionFromServer 時に

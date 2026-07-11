@@ -258,6 +258,7 @@ struct HistoryRow: View {
         switch session.status {
         case .completed: return .green
         case .error: return .red
+        case .cancelled: return .gray
         default: return .blue
         }
     }
@@ -265,7 +266,7 @@ struct HistoryRow: View {
     private var progressColor: Color {
         switch session.status {
         case .error: return .red
-        case .paused: return .gray
+        case .paused, .cancelled: return .gray
         default: return .blue
         }
     }

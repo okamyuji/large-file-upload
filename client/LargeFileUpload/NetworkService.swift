@@ -35,6 +35,11 @@ class NetworkService: NSObject, ObservableObject {
     private var lastPersistAt: [String: Date] = [:]
     private let happyPathPersistInterval: TimeInterval = 2.0
 
+    /// resumeSessionFromServer が「古い OS タスクの掃除」目的で cancel した taskIdentifier の集合。
+    /// delegate 側でここに載っている taskIdentifier の cancel エラーは benign 扱いして
+    /// notifyUploadError を発火させない。pause 経由の cancel (session.status == .paused) と同じ扱い。
+    private var taskIdsPendingResumeCancel: Set<Int> = []
+
     /// 上記のすべての可変辞書 (activeTaskIds/taskStartTimes/currentUploads/uploadQueues/errorCounts/
     /// activeUploadSessions) は複数の実行コンテキスト (URLSession delegate queue / Task / Timer)
     /// から触られるため、直列化するための再入可能ロック。
@@ -220,10 +225,24 @@ class NetworkService: NSObject, ObservableObject {
         // readChunk が黙って失敗して PUT が飛ばなかった (=「再開が効かない」バグの真因)。
         // そこでソースファイルをアプリ所有の Documents/uploads/ にステージングしてから
         // UploadSession に持たせる。以降 session.fileURL はいつでも読める。
-        let stagedURL = try FileManager.shared.stageFileForUpload(
-            sourceURL: fileURL,
-            sessionId: response.sessionId
-        )
+        //
+        // ステージング失敗時はサーバ側にだけセッションが残る「孤立セッション」を防ぐため、
+        // ここで明示的に DELETE してから元のエラーを再送する。
+        let stagedURL: URL
+        do {
+            stagedURL = try FileManager.shared.stageFileForUpload(
+                sourceURL: fileURL,
+                sessionId: response.sessionId
+            )
+        } catch {
+            AppLog.upload.error("⚠️ [ROLLBACK] stageFileForUpload 失敗 → サーバ側セッション削除: \(response.sessionId)")
+            _ = try? await performControlRequest(
+                endpoint: .deleteSession(sessionId: response.sessionId),
+                method: "DELETE",
+                responseType: EmptyResponse.self
+            )
+            throw error
+        }
 
         let session = UploadSession(
             id: response.sessionId,
@@ -462,11 +481,15 @@ class NetworkService: NSObject, ObservableObject {
         )
         AppLog.upload.notice("🔁 [RESUME] 同期完了: uploaded=\(session.uploadedChunks.count)/\(session.totalChunks) missing=\(status.missingChunks.count)")
 
-        // 進行中の OS タスクがあれば片付ける (このセッション分のみ)
+        // 進行中の OS タスクがあれば片付ける (このセッション分のみ)。
+        // cancel された taskIdentifier は「resume 由来の意図した cancel」として記録し、
+        // delegate 側でエラー通知に流さないようにする (session.status は .uploading のままなので
+        // paused fast path には乗らない)。
         let osTasks = await backgroundSession.allTasks
         for task in osTasks {
             if let url = task.originalRequest?.url,
                Self.extractSessionId(from: url) == session.id {
+                withState { taskIdsPendingResumeCancel.insert(task.taskIdentifier) }
                 task.cancel()
             }
         }
@@ -756,12 +779,16 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
             ?? "HTTP \(httpResp?.statusCode ?? -1)"
         AppLog.upload.notice("❌ チャンク \(chunkIndex ?? -1) 失敗: \(errorDesc) → decision=\(decision)")
 
-        // Pause 対策: cancel が session.status = .paused 由来なら .error に落とさず静かに終わる。
-        // pauseUpload は先に session.status を .paused にセットしてから OS task.cancel() する
-        // 順序になっているので、この分岐がヒットしたら「意図した pause による cancel」と判断できる。
+        // Pause / Resume-cleanup 対策: 意図した cancel は .error に落とさず静かに終わる。
+        // 発火経路が 2 つあり、それぞれ判定材料が違うので両方を見る:
+        //   ① pause 由来: pauseUpload が先に session.status = .paused にしてから cancel する
+        //   ② resume 由来: resumeSessionFromServer が古い OS タスク掃除のために cancel する。
+        //      status は .uploading のままなので、taskIdsPendingResumeCancel の membership で判定する。
         let isCancel = (ns?.domain == NSURLErrorDomain && ns?.code == NSURLErrorCancelled)
-        if isCancel && uploadSession.status == .paused {
-            AppLog.upload.notice("⏸ [PAUSED CANCEL] session=\(sessionId) chunk=\(chunkIndex ?? -1) は pause による cancel。error 通知せずに終了")
+        let isPendingResumeCancel = withState { taskIdsPendingResumeCancel.remove(taskId) != nil }
+        if isCancel && (uploadSession.status == .paused || isPendingResumeCancel) {
+            let reason = isPendingResumeCancel ? "resume-cleanup" : "paused"
+            AppLog.upload.notice("⏸ [BENIGN CANCEL/\(reason)] session=\(sessionId) chunk=\(chunkIndex ?? -1) error 通知せずに終了")
             if let chunkIndex = chunkIndex {
                 cleanupTemporaryFile(sessionId: sessionId, chunkIndex: chunkIndex)
             }
@@ -1526,6 +1553,9 @@ extension NetworkService {
                 }
             } catch let NetworkError.httpError(code, _) where code == 404 {
                 AppLog.upload.notice("🗑 [RECONCILE] session=\(session.id) はサーバ 404 → discard")
+                // discard 前に OS 側の live task も片付ける。片付けを怠ると、
+                // discard 後に delegate が「不明セッションの chunk 完了」を受けて誤動作する。
+                await cancelOSTasks(sessionId: session.id)
                 await MainActor.run {
                     UploadManager.shared.discardSession(sessionId: session.id, reason: "server-404")
                 }

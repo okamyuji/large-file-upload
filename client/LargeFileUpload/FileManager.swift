@@ -178,7 +178,10 @@ class FileManager: ObservableObject {
     func cleanupStagedFile(sessionId: String, fileURL: URL) {
         let uploadsDir = getDocumentsDirectory().appendingPathComponent("uploads", isDirectory: true)
         // fileURL が uploads/ 配下にあれば削除。ユーザーが選んだ元ファイルは絶対に触らない。
-        if fileURL.path.hasPrefix(uploadsDir.path) {
+        // path.hasPrefix(uploadsDir.path) だけだと `Documents/uploads2/…` のような
+        // 兄弟ディレクトリまで巻き込むので、末尾に path separator を明示的に付けて境界判定する。
+        let uploadsPrefix = uploadsDir.path.hasSuffix("/") ? uploadsDir.path : uploadsDir.path + "/"
+        if fileURL.path.hasPrefix(uploadsPrefix) {
             try? Foundation.FileManager.default.removeItem(at: fileURL)
             AppLog.upload.notice("🗑 [STAGE] コピー削除: session=\(sessionId)")
         }
