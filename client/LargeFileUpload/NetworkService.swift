@@ -324,7 +324,15 @@ class NetworkService: NSObject, ObservableObject {
             throw NetworkError.sessionNotFound
         }
 
-        if !queue.isCurrentlyProcessing {
+        // check-and-set を単一 withState で原子化する。ロック外の read だと
+        // 並行呼び出し (resume + didComplete 安全網など) が両方 false を見て
+        // 二重に投入ループへ入る TOCTOU になる。
+        let shouldEnqueue = withState {
+            guard !queue.isCurrentlyProcessing else { return false }
+            queue.setProcessing(true)
+            return true
+        }
+        if shouldEnqueue {
             try enqueueAllPendingChunks(session: session)
         }
     }
@@ -356,6 +364,12 @@ class NetworkService: NSObject, ObservableObject {
                     chunkIndex: chunkIndex,
                     earliestBeginDate: nil
                 )
+                // 追跡辞書 (activeTaskIds/taskStartTimes/currentUploads) はセッション
+                // ごとに 1 エントリなので、一括投入では「最後に投入したタスク」だけを
+                // 保持する。一括投入後のタスクは OS 所有 (httpMaximumConnectionsPerHost=1
+                // で逐次配送) であり、stale 検出や verifyTaskProgress による監視は
+                // ベストエフォート。取りこぼしは resumeSessionFromServer のサーバ同期で
+                // 回収する設計とする。
                 withState {
                     activeTaskIds[session.id] = task.taskIdentifier
                     taskStartTimes[session.id] = Date()
@@ -376,8 +390,16 @@ class NetworkService: NSObject, ObservableObject {
             }
         }
         AppLog.upload.notice("📤 [ENQUEUE ALL] session=\(session.id) \(enqueued) チャンクを一括投入 (バックグラウンド継続対応)")
-        if enqueued == 0, let prepError {
-            throw prepError
+        if enqueued == 0 {
+            // 1 件も投入できなかった場合は processing フラグを必ず戻す。
+            // 呼び出し元 (startSequentialChunkUpload) が check-and-set で true に
+            // している経路や、初回チャンクの prep 失敗経路で true のまま残ると、
+            // in-flight タスクが無いのに以後の投入が isCurrentlyProcessing ガードで
+            // 恒久的にブロックされる。
+            withState { queue.setProcessing(false) }
+            if let prepError {
+                throw prepError
+            }
         }
     }
 
