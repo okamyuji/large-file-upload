@@ -3,6 +3,7 @@ import Foundation
 
 @testable import LargeFileUpload
 
+extension SerializedSingletonTests {
 struct MakeUploadTaskTests {
 
     private func makeTempFile(size: Int = 100) throws -> URL {
@@ -65,4 +66,5 @@ struct MakeUploadTaskTests {
         #expect(NetworkService.extractSessionId(from: url) == nil)
         #expect(NetworkService.extractSessionChunkKey(from: url) == nil)
     }
+}
 }

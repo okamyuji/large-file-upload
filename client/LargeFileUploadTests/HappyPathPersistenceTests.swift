@@ -5,6 +5,7 @@ import Foundation
 
 /// Bug A 対策: happy-path のチャンク完了時にも永続化が走ることを担保する。
 /// persistHappyPath の判定ロジック (initial=無条件 / complete=無条件 / それ以外は 2s デバウンス) を検証する。
+extension SerializedSingletonTests {
 @Suite(.serialized)
 struct HappyPathPersistenceTests {
 
@@ -108,4 +109,5 @@ struct HappyPathPersistenceTests {
         #expect(after1 == after2)
         #expect(after2 == after3)
     }
+}
 }

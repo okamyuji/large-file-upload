@@ -7,6 +7,7 @@ import Foundation
 /// - pauseUpload の .paused が upload_state.json にも書かれること (Force Quit 後の再開誤動作を防ぐ)
 /// - cleanupStagedFile が uploads/ 兄弟ディレクトリを巻き込まないこと (uploads2 等)
 /// - HistoryRow の iconColor / progressColor に .cancelled マッピングがあること (色の一貫性)
+extension SerializedSingletonTests {
 @Suite(.serialized)
 struct CodeRabbitFixTests {
 
@@ -122,4 +123,5 @@ struct CodeRabbitFixTests {
         #expect(historyRowProgressColorName(for: .error) == "red")
         #expect(historyRowProgressColorName(for: .completed) == "blue")
     }
+}
 }
