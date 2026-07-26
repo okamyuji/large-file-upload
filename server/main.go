@@ -21,7 +21,6 @@ const (
 	WriteTimeout           = 60 * time.Second  // レスポンス送信用に延長
 	IdleTimeout            = 120 * time.Second // 接続維持時間を延長
 	SessionCleanupInterval = 1 * time.Hour
-	SessionMaxAge          = 24 * time.Hour
 )
 
 func main() {
@@ -32,6 +31,8 @@ func main() {
 
 	// サービス初期化
 	uploadService := services.NewUploadService()
+	log.Printf("保持期間: 未完了セッション %s / 完了済みセッション %s",
+		services.DefaultIncompleteSessionMaxAge, services.DefaultCompletedSessionMaxAge)
 
 	// ハンドラー初期化
 	uploadHandler := handlers.NewUploadHandler(uploadService)
@@ -131,7 +132,7 @@ func startSessionCleanup(uploadService *services.UploadService) {
 	defer ticker.Stop()
 
 	for range ticker.C {
-		deletedCount := uploadService.CleanupExpiredSessions(SessionMaxAge)
+		deletedCount := uploadService.CleanupExpiredSessions()
 		if deletedCount > 0 {
 			log.Printf("期限切れセッション %d 個を削除しました", deletedCount)
 		}

@@ -58,11 +58,14 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<!-- UIBackgroundModes に指定できるのは Apple が定めた固定値のみで、
+	     background-fetch / background-processing / background-upload はいずれも存在しない。
+	     誤った値を書くと BGTaskScheduler.submit が notPermitted で失敗する。
+	     BackgroundURLSession による転送自体はこのキーを必要としない。 -->
 	<key>UIBackgroundModes</key>
 	<array>
-		<string>background-fetch</string>
-		<string>background-processing</string>
-		<string>background-upload</string>
+		<string>fetch</string>
+		<string>processing</string>
 	</array>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>

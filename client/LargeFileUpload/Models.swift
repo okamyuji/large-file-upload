@@ -29,6 +29,13 @@ struct StatusResponse: Codable {
     let uploadedChunks: Int
     let missingChunks: [Int]
     let progress: Double
+    /// サーバ側でセッションが削除される時刻。これを過ぎると再開できず404になる。
+    /// この項目を返さないサーバとも通信できるよう optional にしておく。
+    let expiresAt: String?
+    /// 結合や整合性検証が失敗した理由。status が error のときに入る。
+    let finalizeError: String?
+    /// やり直しても結果が変わらない失敗かどうか。false なら complete の再試行で回復し得る。
+    let finalizeFatal: Bool?
 }
 
 struct CompleteResponse: Codable {
@@ -84,6 +91,16 @@ class UploadSession: ObservableObject, Codable {
         uploadedChunks.count == totalChunks
     }
 
+    /// サーバが提示した再開可能期限。GET /status の成功応答から取り込む。
+    /// 404 を受けたときに「期限切れ」と「原因不明の消失」を区別するために使う。
+    var serverExpiresAt: Date?
+
+    /// 自動での再開を止めるかどうか。リトライ上限に達した場合と、サーバが
+    /// やり直しても変わらない失敗と言っている場合に立てる。
+    /// これが無いと、フォアグラウンド復帰のたびに突き合わせが再開させてしまい、
+    /// リトライ回数の上限が実質的に効かなくなる。
+    @Published var autoResumeBlocked: Bool = false
+
     init(
         id: String,
         fileName: String,
@@ -107,6 +124,7 @@ class UploadSession: ObservableObject, Codable {
     private enum CodingKeys: String, CodingKey {
         case id, fileName, fileURL, totalChunks, fileSize, fileChecksum, chunkSize
         case status, uploadedChunks, progress, error, chunkRetryCounts, chunkNextRetryAt
+        case serverExpiresAt, autoResumeBlocked
     }
 
     required init(from decoder: Decoder) throws {
@@ -122,6 +140,8 @@ class UploadSession: ObservableObject, Codable {
         self.uploadedChunks = try c.decodeIfPresent(Set<Int>.self, forKey: .uploadedChunks) ?? []
         self.progress = try c.decodeIfPresent(Double.self, forKey: .progress) ?? 0.0
         self.error = try c.decodeIfPresent(String.self, forKey: .error)
+        self.serverExpiresAt = try c.decodeIfPresent(Date.self, forKey: .serverExpiresAt)
+        self.autoResumeBlocked = try c.decodeIfPresent(Bool.self, forKey: .autoResumeBlocked) ?? false
         // JSON はキーが String のみなので [String:_] 経由で復元
         if let raw = try c.decodeIfPresent([String: Int].self, forKey: .chunkRetryCounts) {
             var mapped: [Int: Int] = [:]
@@ -140,6 +160,8 @@ class UploadSession: ObservableObject, Codable {
         try c.encode(id, forKey: .id)
         try c.encode(fileName, forKey: .fileName)
         try c.encode(fileURL, forKey: .fileURL)
+        try c.encodeIfPresent(serverExpiresAt, forKey: .serverExpiresAt)
+        try c.encode(autoResumeBlocked, forKey: .autoResumeBlocked)
         try c.encode(totalChunks, forKey: .totalChunks)
         try c.encode(fileSize, forKey: .fileSize)
         try c.encode(fileChecksum, forKey: .fileChecksum)

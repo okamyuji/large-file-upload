@@ -54,9 +54,14 @@ enum RetryClassifier {
             switch status {
             case 200...299:
                 return .fail // 成功ケース。呼び出し側は事前に分岐している想定。
-            case 429:
+            // 429 と 503 はどちらもサーバが Retry-After で待ってほしい秒数を伝えてくる。
+            // 503 でヘッダを読み落とすと、サーバが指定した期間より早く再送してしまう。
+            case 429, 503:
+                // サーバが指定した秒数はそのまま渡す。上限で切り詰めると指定より早く
+                // 再送することになり、Retry-After を尊重したことにならない。
+                // 長すぎる指定をどう扱うかは呼び出し側の方針として scheduleChunkRetry で決める。
                 if let sec = parseRetryAfter(retryAfterHeader) {
-                    return .retryAfter(min(sec, RetryPolicy.maxRetryAfterCap))
+                    return .retryAfter(sec)
                 }
                 return .retry
             case 500...599:

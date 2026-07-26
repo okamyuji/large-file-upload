@@ -6,21 +6,28 @@ import Foundation
 extension SerializedSingletonTests {
 struct MakeUploadTaskTests {
 
-    private func makeTempFile(size: Int = 100) throws -> URL {
-        let url = Foundation.FileManager.default.temporaryDirectory.appendingPathComponent("mut_\(UUID().uuidString).bin")
-        Foundation.FileManager.default.createFile(atPath: url.path, contents: Data(repeating: 0, count: size))
-        return url
+    /// session.fileURL はステージング済みチャンクを収めたディレクトリを指す。
+    /// makeUploadTask はそのチャンクをそのまま送るので、テストでも同じ形を用意する。
+    private func makeStagedSession(id: String, size: Int = 100, chunkSize: Int = 20) throws -> UploadSession {
+        let source = Foundation.FileManager.default.temporaryDirectory.appendingPathComponent("mut_\(UUID().uuidString).bin")
+        Foundation.FileManager.default.createFile(atPath: source.path, contents: Data(repeating: 7, count: size))
+        defer { try? Foundation.FileManager.default.removeItem(at: source) }
+
+        let totalChunks = (size + chunkSize - 1) / chunkSize
+        let stagedDir = try LargeFileUpload.FileManager.shared.stageChunksForUpload(
+            sourceURL: source, sessionId: id, chunkSize: chunkSize, totalChunks: totalChunks
+        )
+        return UploadSession(
+            id: id, fileName: source.lastPathComponent, fileURL: stagedDir,
+            totalChunks: totalChunks, fileSize: Int64(size), fileChecksum: "x", chunkSize: chunkSize
+        )
     }
 
     @Test("makeUploadTask: earliestBeginDate=nil でも作成成功、プロパティはデフォルト")
     func noEarliestBeginDate() throws {
-        let file = try makeTempFile(size: 100)
-        defer { try? Foundation.FileManager.default.removeItem(at: file) }
+        let session = try makeStagedSession(id: "sess-mut1")
+        defer { LargeFileUpload.FileManager.shared.cleanupStagedFile(sessionId: session.id, fileURL: session.fileURL) }
 
-        let session = UploadSession(
-            id: "sess-mut1", fileName: file.lastPathComponent, fileURL: file,
-            totalChunks: 5, fileSize: 100, fileChecksum: "x", chunkSize: 20
-        )
         let task = try NetworkService.shared.makeUploadTask(session: session, chunkIndex: 0, earliestBeginDate: nil)
         // earliestBeginDate をセットしていなければ optional は nil または distant past
         if let ebd = task.earliestBeginDate {
@@ -31,13 +38,9 @@ struct MakeUploadTaskTests {
 
     @Test("makeUploadTask: earliestBeginDate を指定すると task.earliestBeginDate に一致")
     func withEarliestBeginDate() throws {
-        let file = try makeTempFile(size: 100)
-        defer { try? Foundation.FileManager.default.removeItem(at: file) }
+        let session = try makeStagedSession(id: "sess-mut2")
+        defer { LargeFileUpload.FileManager.shared.cleanupStagedFile(sessionId: session.id, fileURL: session.fileURL) }
 
-        let session = UploadSession(
-            id: "sess-mut2", fileName: file.lastPathComponent, fileURL: file,
-            totalChunks: 5, fileSize: 100, fileChecksum: "x", chunkSize: 20
-        )
         let target = Date().addingTimeInterval(120)
         let task = try NetworkService.shared.makeUploadTask(session: session, chunkIndex: 1, earliestBeginDate: target)
         if let ebd = task.earliestBeginDate {

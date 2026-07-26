@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -199,34 +200,66 @@ func GetFileSize(filePath string) (int64, error) {
 	return fileInfo.Size(), nil
 }
 
-// CombineChunks チャンクファイルを結合して最終ファイルを作成
+// CombineChunks チャンクファイルを結合して最終ファイルを作成する。
+//
+// 一時ファイルへ書いて fsync してから rename で確定させる。この順序が要るのは、
+// 呼び出し側が結合完了を completed として記録し、そのあとチャンクの実体を削除するためである。
+// 最終ファイルの中身がディスクに届く前に completed だけが永続化されると、電源断のあとに
+// 「完了と記録されているが中身が欠けていて、作り直す材料も無い」という復旧不能な状態が残る。
 func CombineChunks(session *models.UploadSession) (string, error) {
 	finalFilePath := filepath.Join(session.WorkingDir, session.FileName)
+	tempFilePath := finalFilePath + ".combining." + generateRandomString(8)
 
-	finalFile, err := os.Create(finalFilePath)
+	finalFile, err := os.Create(tempFilePath)
 	if err != nil {
 		return "", fmt.Errorf("最終ファイル作成エラー: %w", err)
 	}
-	defer func() { _ = finalFile.Close() }()
 
 	// チャンクを順序通りに結合
-	for i := 0; i < session.TotalChunks; i++ {
-		chunkInfo, exists := session.UploadedChunks[i]
-		if !exists {
-			return "", fmt.Errorf("チャンク %d が見つかりません", i)
-		}
+	combineErr := func() error {
+		for i := 0; i < session.TotalChunks; i++ {
+			chunkInfo, exists := session.UploadedChunks[i]
+			if !exists {
+				return fmt.Errorf("チャンク %d が見つかりません", i)
+			}
 
-		chunkFile, err := os.Open(chunkInfo.FilePath)
-		if err != nil {
-			return "", fmt.Errorf("チャンクファイル %d 読み込みエラー: %w", i, err)
-		}
+			chunkFile, openErr := os.Open(chunkInfo.FilePath)
+			if openErr != nil {
+				return fmt.Errorf("チャンクファイル %d 読み込みエラー: %w", i, openErr)
+			}
 
-		_, err = io.Copy(finalFile, chunkFile)
-		_ = chunkFile.Close()
+			_, copyErr := io.Copy(finalFile, chunkFile)
+			_ = chunkFile.Close()
 
-		if err != nil {
-			return "", fmt.Errorf("チャンク %d 結合エラー: %w", i, err)
+			if copyErr != nil {
+				return fmt.Errorf("チャンク %d 結合エラー: %w", i, copyErr)
+			}
 		}
+		// 中身をディスクへ届けてから rename する
+		if syncErr := finalFile.Sync(); syncErr != nil {
+			return fmt.Errorf("最終ファイル同期エラー: %w", syncErr)
+		}
+		return nil
+	}()
+
+	if closeErr := finalFile.Close(); closeErr != nil && combineErr == nil {
+		combineErr = fmt.Errorf("最終ファイルクローズエラー: %w", closeErr)
+	}
+
+	if combineErr != nil {
+		_ = os.Remove(tempFilePath)
+		return "", combineErr
+	}
+
+	if err := os.Rename(tempFilePath, finalFilePath); err != nil {
+		_ = os.Remove(tempFilePath)
+		return "", fmt.Errorf("最終ファイル確定エラー: %w", err)
+	}
+
+	// rename 自体を耐久化するため親ディレクトリも同期する
+	if dir, dirErr := os.Open(filepath.Dir(finalFilePath)); dirErr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 
 	return finalFilePath, nil
@@ -337,8 +370,10 @@ func (cl *ChunkLock) Release() error {
 	return nil
 }
 
-// AtomicChunkWrite 原子的なチャンク書き込み
-func AtomicChunkWrite(filePath string, data []byte) error {
+// AtomicWriteFile 一時ファイルへ書いて fsync してから rename で確定させる。
+// fsync を省くと、rename が先に永続化されて中身が空のファイルだけが残る事故が起きる。
+// 受け取り済みとして記録する前に、実体がディスクに載っていることを保証する。
+func AtomicWriteFile(filePath string, data []byte) error {
 	// 一時ファイルパスを生成
 	tempFilePath := filePath + ".tmp." + generateRandomString(8)
 
@@ -348,13 +383,22 @@ func AtomicChunkWrite(filePath string, data []byte) error {
 		return fmt.Errorf("一時ファイル作成エラー: %w", err)
 	}
 
-	// データ書き込み
+	// データ書き込み → fsync → close の順で耐久化する
 	_, writeErr := tempFile.Write(data)
+	var syncErr error
+	if writeErr == nil {
+		syncErr = tempFile.Sync()
+	}
 	closeErr := tempFile.Close()
 
 	if writeErr != nil {
 		_ = os.Remove(tempFilePath) // クリーンアップ
 		return fmt.Errorf("一時ファイル書き込みエラー: %w", writeErr)
+	}
+
+	if syncErr != nil {
+		_ = os.Remove(tempFilePath) // クリーンアップ
+		return fmt.Errorf("一時ファイル同期エラー: %w", syncErr)
 	}
 
 	if closeErr != nil {
@@ -368,7 +412,111 @@ func AtomicChunkWrite(filePath string, data []byte) error {
 		return fmt.Errorf("ファイル移動エラー: %w", err)
 	}
 
+	// rename 自体を耐久化するため親ディレクトリも同期する
+	if dir, dirErr := os.Open(filepath.Dir(filePath)); dirErr == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+
 	return nil
+}
+
+// AtomicChunkWrite 原子的なチャンク書き込み
+func AtomicChunkWrite(filePath string, data []byte) error {
+	return AtomicWriteFile(filePath, data)
+}
+
+// CleanupStaleTempFiles セッションの作業ディレクトリに残った書きかけの一時ファイルを削除する。
+//
+// 結合中や原子的書き込みの最中にプロセスが落ちると、`.combining.*` や `.tmp.*` が残る。
+// 結合の一時ファイルは最終ファイルと同じ大きさになり得るので、再起動のたびに積み上がると
+// 作業領域を使い切り、既存セッションの結合も新規チャンクの受信も失敗するようになる。
+func CleanupStaleTempFiles(workingDir string) {
+	entries, err := os.ReadDir(workingDir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.Contains(name, ".combining.") && !strings.Contains(name, ".tmp.") {
+			continue
+		}
+		path := filepath.Join(workingDir, name)
+		if removeErr := os.Remove(path); removeErr == nil {
+			log.Printf("🧹 [CLEANUP] 書きかけの一時ファイルを削除: %s", path)
+		}
+	}
+}
+
+// sessionManifestName セッション状態を保存するマニフェストのファイル名
+const sessionManifestName = "session.json"
+
+// SaveSessionManifest セッション状態を作業ディレクトリへ原子的に書き出す。
+// サーバをSoTとして扱う以上、受信済みチャンクの記録はプロセスの寿命を越えて残る必要がある。
+func SaveSessionManifest(session *models.UploadSession) error {
+	manifestPath, err := SafeSessionFilePath(session.ID, sessionManifestName)
+	if err != nil {
+		return fmt.Errorf("マニフェストパス検証エラー: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0755); err != nil {
+		return fmt.Errorf("マニフェストディレクトリ作成エラー: %w", err)
+	}
+
+	data, err := json.Marshal(session)
+	if err != nil {
+		return fmt.Errorf("マニフェストエンコードエラー: %w", err)
+	}
+
+	return AtomicWriteFile(manifestPath, data)
+}
+
+// LoadPersistedSessions uploads 配下のマニフェストをすべて読み込む。
+// 壊れた1件が他のセッションの復元を止めないよう、読めないものは読み飛ばす。
+func LoadPersistedSessions() ([]*models.UploadSession, error) {
+	entries, err := os.ReadDir(uploadsRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("uploadsディレクトリ読み込みエラー: %w", err)
+	}
+
+	sessions := make([]*models.UploadSession, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		manifestPath, pathErr := SafeSessionFilePath(entry.Name(), sessionManifestName)
+		if pathErr != nil {
+			continue
+		}
+
+		data, readErr := os.ReadFile(manifestPath)
+		if readErr != nil {
+			continue
+		}
+
+		var session models.UploadSession
+		if unmarshalErr := json.Unmarshal(data, &session); unmarshalErr != nil {
+			continue
+		}
+
+		// ディレクトリ名とマニフェスト内のIDが食い違うものは信用しない
+		if session.ID != entry.Name() {
+			continue
+		}
+
+		if session.UploadedChunks == nil {
+			session.UploadedChunks = make(map[int]models.ChunkInfo)
+		}
+
+		sessions = append(sessions, &session)
+	}
+
+	return sessions, nil
 }
 
 // generateRandomString ランダム文字列生成（内部用）

@@ -18,8 +18,9 @@ struct RetryPolicy: Sendable, Equatable {
         jitterRatio: 0.2
     )
 
-    /// Retry-After ヘッダ値のクランプ上限 (秒)。
-    /// サーバが極端に大きな値を返した場合の暴走を防ぐ。
+    /// 自動リトライとして待てる Retry-After の上限 (秒)。
+    /// これを超える指定を短い時間へ切り詰めると、サーバが求めた時刻より早く再送してしまう。
+    /// そこで切り詰めずに自動リトライを打ち切り、次回起動時の突き合わせかユーザー操作に委ねる。
     static let maxRetryAfterCap: TimeInterval = 300
 
     /// - Parameter attempt: 1-origin の試行回数

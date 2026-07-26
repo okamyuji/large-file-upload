@@ -136,28 +136,8 @@ class UploadManager: ObservableObject {
     }
 
     func retryFailedUploads() async {
-        let failedSessions = activeUploads.values.filter { $0.status == .error }
-
-        for session in failedSessions {
-            do {
-                AppLog.upload.notice("🔄 失敗アップロードの再試行: \(session.fileName)")
-                
-                // 逐次処理でアップロード再開
-                try await networkService.startUpload(session: session)
-                
-                // バックグラウンド安全な状態更新
-                updateSessionSafely(session) { session in
-                    session.updateStatus(.uploading)
-                }
-                updateStateSafely {
-                    self.updateUploadingStatus()
-                }
-                
-                AppLog.upload.notice("✅ 逐次処理アップロード再開成功: \(session.fileName)")
-            } catch {
-                AppLog.upload.notice("❌ 再試行エラー (\(session.fileName)): \(error)")
-                await handleUploadErrorSafely(session: session, error: error)
-            }
+        for sessionId in activeUploads.values.filter({ $0.status == .error }).map(\.id) {
+            try? await resumeUpload(sessionId: sessionId)
         }
     }
 
@@ -168,16 +148,11 @@ class UploadManager: ObservableObject {
             return
         }
 
-        // 復元された active session をサーバ状態と同期して未送信チャンクの送信を再開
-        for (_, session) in activeUploads where session.status != .completed && session.status != .error {
-            do {
-                try await networkService.resumeSessionFromServer(session)
-            } catch {
-                AppLog.upload.error("resume 失敗 (\(session.fileName)): \(error.localizedDescription)")
-            }
-        }
-
-        await networkService.refreshAllSessionStatus()
+        // フォアグラウンド復帰でも起動時と同じチャンク単位の突き合わせを通す。
+        // セッションごとに resumeSessionFromServer を呼ぶ作りだと、OS 側で送信中のタスクを
+        // 毎回すべてキャンセルして積み直すことになる。さらに一時停止中のセッションまで
+        // ユーザーの意思に反して再開してしまう。
+        await networkService.reconcileWithServer()
 
         await MainActor.run {
             self.updateUploadingStatus()
@@ -215,21 +190,50 @@ class UploadManager: ObservableObject {
             fileURL: fileURL
         )
 
-        // Bug A 対策: 最初のチャンクが到達する前でも Force Quit されたセッションを
-        // 復元できるよう、セッション作成直後に永続化する。
-        // 従来は updateStateSafely (async schedule) → saveActiveStateSync の 2 段構えで
-        // 変更前スナップショットが disk に残る race があった。performStateMutationAndPersist に統一する。
-        performStateMutationAndPersist { [weak self] in
-            guard let self = self else { return }
-            self.activeUploads[session.id] = session
-            self.isUploading = true
-        }
+        // セッションの登録と永続化は createUploadSession の中で、ステージングより前に
+        // 同期的に済ませている (registerNewSession)。ここで改めて積むと、保存完了を
+        // 待たないまま送信を始めることになるので何もしない。
 
         // BackgroundURLSessionでアップロード開始
         try await networkService.startUpload(session: session)
         
         AppLog.upload.notice("✅ BackgroundURLSessionアップロード開始: \(session.fileName)")
         return session
+    }
+
+    /// 新規セッションを手元に登録し、保存が終わるまで待つ。
+    ///
+    /// サーバにセッションを作った直後、まだ手元に記録が無い時間帯に強制終了されると、
+    /// サーバにだけセッションが残って次回起動の突き合わせ対象から漏れる。
+    /// 保存の完了を待ってから先へ進めることで、その空白を無くす。
+    func registerNewSession(_ session: UploadSession) async throws {
+        try await MainActor.run {
+            self.activeUploads[session.id] = session
+            self.isUploading = true
+            do {
+                try self.writeUploadState()
+            } catch {
+                // 記録できないまま送信を始めると、強制終了で行方不明のセッションになる。
+                // 呼び出し元がサーバ側を片付けられるよう、登録を取り消してから投げ返す。
+                self.activeUploads.removeValue(forKey: session.id)
+                self.updateUploadingStatus()
+                throw error
+            }
+        }
+    }
+
+    /// サーバへ問い合わせできないセッションを、手元に残したまま失敗として記録する。
+    ///
+    /// 期限切れと確認できない404は、サーバ側の一時的な不調かもしれない。
+    /// 履歴へ移してしまうと次回以降の突き合わせ対象から外れ、ステージングも
+    /// 孤立扱いで掃除されてしまうため、active に残したまま状態だけを失敗にする。
+    func markSessionUnreachable(sessionId: String, reason: String) {
+        performStateMutationAndPersist { [weak self] in
+            guard let self = self, let session = self.activeUploads[sessionId] else { return }
+            AppLog.upload.error("⚠️ [UNREACHABLE] session=\(sessionId) reason=\(reason) (手元のチャンクは保持)")
+            session.setError("サーバに問い合わせできません (\(reason))")
+            self.updateUploadingStatus()
+        }
     }
 
     func pauseUpload(sessionId: String) {
@@ -252,12 +256,24 @@ class UploadManager: ObservableObject {
         AppLog.upload.notice("アップロード一時停止: \(session.fileName)")
     }
 
+    /// 利用者が明示的に選んだ再開・再試行。自動の突き合わせとは別扱いにする。
+    ///
+    /// 一時停止からの再開も、上限に達した失敗からの再試行も、やることは同じ。
+    /// 経路を分けると片方だけリトライ回数を戻し忘れる、片方だけ空のキューへ
+    /// 投入して何も送られない、といった食い違いが出る。
     func resumeUpload(sessionId: String) async throws {
         guard let session = activeUploads[sessionId] else { return }
+
+        // 明示操作なので、自動再開の停止と積み上がったリトライ回数を戻す。
+        // 自動の突き合わせでこれをやると上限が効かなくなるため、ここだけで行う。
+        session.autoResumeBlocked = false
+        session.chunkRetryCounts.removeAll()
+        session.chunkNextRetryAt.removeAll()
 
         updateSessionSafely(session) { session in
             session.updateStatus(.uploading)
         }
+        saveActiveStateSync()
         AppLog.upload.notice("🔄 アップロード再開: \(session.fileName)")
 
         // Resume Bug 対策: startUpload は「初回・queue 生存前提」の経路であり、
@@ -334,6 +350,10 @@ class UploadManager: ObservableObject {
         // Bug 対策: discardSession と同じく、変更と save を同一同期ブロックで実行する。
         // 従来は updateStateSafely (foreground では async) → saveUploadHistory の順で、
         // 完了処理でも「削除前スナップショットが disk に残る」race があった。
+        //
+        // 再送材料を消すのは、履歴への移動が保存できたことを確かめてから。
+        // 先に消すと、保存前に強制終了された場合に「送信中のまま復元されるのに
+        // 送るチャンクが無い」という復旧できない状態になる。
         performStateMutationAndPersist { [weak self] in
             guard let self = self else { return }
             self.activeUploads.removeValue(forKey: session.id)
@@ -342,6 +362,8 @@ class UploadManager: ObservableObject {
                 self.uploadHistory = Array(self.uploadHistory.prefix(50))
             }
             self.updateUploadingStatus()
+        } onPersisted: {
+            NetworkService.shared.cleanupAfterPersistedCompletion(session: session)
         }
     }
 
@@ -395,38 +417,81 @@ class UploadManager: ObservableObject {
         saveUploadHistory()
     }
 
+    /// 保存の成否を呼び出し元へ返す。耐久化できたことを確かめてから
+    /// 次の動作へ進みたい経路 (再送予定の登録など) で使う。
+    func persistActiveState() throws {
+        try writeUploadState()
+    }
+
+    /// 状態ファイルへの書き込みを直列化するロック。
+    /// URLSession の delegate queue と MainActor の両方から呼ばれるため、
+    /// 直列化しないと encode 途中の内容が混ざったファイルが残る。
+    private static let stateWriteLock = NSLock()
+
     private func saveUploadHistory() {
         do {
-            let state = PersistedState(
-                history: uploadHistory,
-                active: Array(activeUploads.values)
-            )
-            let encoder = JSONEncoder()
-            let data = try encoder.encode(state)
-            try data.write(to: stateFileURL())
+            try writeUploadState()
         } catch {
             AppLog.upload.error("状態保存エラー: \(error.localizedDescription)")
         }
     }
 
+    /// 状態ファイルへの書き込み本体。失敗を呼び出し元へ返す。
+    /// 記録が残らないまま送信を始めると、強制終了でセッションが行方不明になる。
+    private func writeUploadState() throws {
+        UploadManager.stateWriteLock.lock()
+        defer { UploadManager.stateWriteLock.unlock() }
+
+        let state = PersistedState(
+            history: uploadHistory,
+            active: Array(activeUploads.values)
+        )
+        let data = try JSONEncoder().encode(state)
+
+        let url = stateFileURL()
+        // 直前の内容をバックアップしてから差し替える。書き込み中に電源が落ちても
+        // 「壊れた本体 + 直前の正常なバックアップ」が残り、起動時に読み戻せる。
+        let backupURL = url.appendingPathExtension("bak")
+        if Foundation.FileManager.default.fileExists(atPath: url.path) {
+            try? Foundation.FileManager.default.removeItem(at: backupURL)
+            try? Foundation.FileManager.default.copyItem(at: url, to: backupURL)
+        }
+
+        // .atomic は一時ファイルへ書いて rename する。中途半端な内容が本体に残らない。
+        try data.write(to: url, options: .atomic)
+    }
+
     private func loadUploadHistory() {
         let url = stateFileURL()
-        guard Foundation.FileManager.default.fileExists(atPath: url.path) else { return }
+        guard let state = decodePersistedState(at: url)
+            ?? decodePersistedState(at: url.appendingPathExtension("bak")) else {
+            return
+        }
+        applyPersistedState(state)
+    }
+
+    /// 状態ファイルを読む。壊れていれば nil を返し、呼び出し側がバックアップへ切り替える。
+    private func decodePersistedState(at url: URL) -> PersistedState? {
+        guard Foundation.FileManager.default.fileExists(atPath: url.path) else { return nil }
         do {
             let data = try Data(contentsOf: url)
-            let state = try JSONDecoder().decode(PersistedState.self, from: data)
-            self.uploadHistory = state.history
-            for s in state.active {
-                self.activeUploads[s.id] = s
-                // FLAW 5 対策: NetworkService 側にも同じ参照を登録して session identity を統一する。
-                // これで scheduleChunkRetry が触る activeUploadSessions[id] と UploadManager.activeUploads[id]
-                // が同一インスタンスを指し、永続化の内容が最新の retry state を反映する。
-                NetworkService.shared.activeUploadSessions[s.id] = s
-            }
-            AppLog.upload.notice("状態を復元しました: history=\(state.history.count) active=\(state.active.count)")
+            return try JSONDecoder().decode(PersistedState.self, from: data)
         } catch {
-            AppLog.upload.error("状態読み込みエラー: \(error.localizedDescription)")
+            AppLog.upload.error("状態読み込みエラー (\(url.lastPathComponent)): \(error.localizedDescription)")
+            return nil
         }
+    }
+
+    private func applyPersistedState(_ state: PersistedState) {
+        self.uploadHistory = state.history
+        for s in state.active {
+            self.activeUploads[s.id] = s
+            // FLAW 5 対策: NetworkService 側にも同じ参照を登録して session identity を統一する。
+            // これで scheduleChunkRetry が触る activeUploadSessions[id] と UploadManager.activeUploads[id]
+            // が同一インスタンスを指し、永続化の内容が最新の retry state を反映する。
+            NetworkService.shared.activeUploadSessions[s.id] = s
+        }
+        AppLog.upload.notice("状態を復元しました: history=\(state.history.count) active=\(state.active.count)")
     }
 
     // MARK: - Notifications (バックグラウンド対応)
@@ -553,7 +618,10 @@ extension UploadManager {
     /// の直後に saveActiveStateSync() を呼んでいたため、**save が変更前スナップショットを書いてしまい**、
     /// Force Quit で「削除したはずのセッションが復活」する不具合があった。
     /// 状態変更と永続化を同一の同期ブロックに閉じ込めることでこの race を排除する。
-    func discardSession(sessionId: String, reason: String) {
+    /// - Parameter keepStagedFile: ステージング済みチャンクを残すかどうか。
+    ///   サーバ側で期限切れと確認できた場合だけ false にする。理由の分からない 404 で
+    ///   消してしまうと、送り直す材料が手元から無くなる。
+    func discardSession(sessionId: String, reason: String, keepStagedFile: Bool = false) {
         performStateMutationAndPersist { [weak self] in
             guard let self = self else { return }
             guard let session = self.activeUploads[sessionId] else {
@@ -567,8 +635,13 @@ extension UploadManager {
             if self.uploadHistory.count > 50 {
                 self.uploadHistory = Array(self.uploadHistory.prefix(50))
             }
-            // ステージングファイルは破棄経路でも掃除する。ユーザーの元ファイルは触らない。
-            FileManager.shared.cleanupStagedFile(sessionId: sessionId, fileURL: session.fileURL)
+            // ステージングは破棄経路でも掃除する。ユーザーの元ファイルは触らない。
+            // ただし理由の分からない 404 では残し、後続の突き合わせで判断できるようにする。
+            if keepStagedFile {
+                AppLog.upload.notice("📦 [DISCARD] session=\(sessionId) のステージングは保持 (reason=\(reason))")
+            } else {
+                FileManager.shared.cleanupStagedFile(sessionId: sessionId, fileURL: session.fileURL)
+            }
             self.updateUploadingStatus()
         }
     }
@@ -585,14 +658,19 @@ extension UploadManager {
     /// - Thread.isMainThread ≠ MainActor isolated なので assumeIsolated は使わない。
     /// - foreground では常に Task { @MainActor in ... } で 1 hop するが、mutation と save が
     ///   同じ closure に閉じ込められているため、途中で reconcile 等が割り込む可能性はない。
-    func performStateMutationAndPersist(_ mutation: @escaping () -> Void) {
+    func performStateMutationAndPersist(
+        _ mutation: @escaping () -> Void,
+        onPersisted: (() -> Void)? = nil
+    ) {
         if isAppInBackground {
             mutation()
             saveActiveStateSync()
+            onPersisted?()
         } else {
             Task { @MainActor in
                 mutation()
                 self.saveActiveStateSync()
+                onPersisted?()
             }
         }
     }

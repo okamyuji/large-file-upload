@@ -26,9 +26,16 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         completionHandler: @escaping () -> Void
     ) {
         AppLog.upload.notice("🔔 BackgroundURLSession イベント処理: \(identifier)")
-        
-        // NetworkServiceにcompletionHandlerを渡す
-        NetworkService.shared.backgroundCompletionHandler = completionHandler
+
+        // 順序が重要。handler を先にセッション非依存のレジストリへ登録し、そのあとで
+        // 同じ identifier のセッションを作り直して再関連付けする。
+        // NetworkService の property へ直接代入すると、代入の評価時に singleton 初期化が走って
+        // セッションが先に生成され、Apple が求める順序と逆になる。
+        BackgroundSessionCompletionRegistry.shared.store(
+            identifier: identifier,
+            handler: completionHandler
+        )
+        NetworkService.shared.activateBackgroundSession()
     }
     
     // MARK: - Background Tasks
@@ -56,40 +63,52 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         AppLog.upload.notice("✅ バックグラウンドタスクの設定を完了しました")
     }
     
+    /// バックグラウンドで定期的に走る後始末の枠。
+    ///
+    /// ここでやるのは、サーバの `GET /status` とクライアントの記憶を突き合わせて
+    /// 未送信チャンクを再投入し、消えたセッションを破棄し、残った一時ファイルを掃除することまで。
+    /// 転送そのものは BackgroundURLSession が所有しているので、この枠の中では動かさない。
+    /// 実行時間には上限があるため、超過しそうになったら expirationHandler で打ち切る。
     @available(iOS 13.0, *)
     private func handleBackgroundUploadTask(task: BGProcessingTask) {
-        AppLog.upload.notice("🔄 バックグラウンドアップロードタスク実行")
+        AppLog.upload.notice("🔄 バックグラウンド整合タスク実行")
 
+        // 期限切れと正常終了は同時に起こり得る。`Task.isCancelled` を見てから
+        // setTaskCompleted を呼ぶだけでは、その隙間に期限切れが割り込んで二重完了になる。
+        // 完了通知は一度きりに保証する。
+        let completion = SingleShotTaskCompletion(task: task)
         var workTask: Task<Void, Never>?
 
-        // タスクの期限切れ処理: 進行中の Task をキャンセルしてから setTaskCompleted(false) を呼ぶ
         task.expirationHandler = {
             AppLog.upload.notice("⏰ バックグラウンドタスクが期限切れになりました")
             workTask?.cancel()
-            task.setTaskCompleted(success: false)
+            completion.complete(success: false)
         }
 
-        // バックグラウンドでのアップロード処理。Task ハンドルを保持し、
-        // 期限切れで cancel された場合は setTaskCompleted を呼ばない
-        // (BGProcessingTask.setTaskCompleted の二重呼び出しは未定義動作)。
         workTask = Task {
-            await NetworkService.shared.refreshAllSessionStatus()
+            await NetworkService.shared.reconcileWithServer()
             guard !Task.isCancelled else { return }
-            task.setTaskCompleted(success: true)
+            NetworkService.shared.cleanupOrphanedStagedSessions()
+            completion.complete(success: !Task.isCancelled)
         }
     }
     
     @available(iOS 13.0, *)
     private func handleRefreshTask(task: BGAppRefreshTask) {
         AppLog.upload.notice("🔄 アプリリフレッシュタスク実行")
-        
+
+        let completion = SingleShotTaskCompletion(task: task)
+        var workTask: Task<Void, Never>?
+
         task.expirationHandler = {
-            task.setTaskCompleted(success: false)
+            AppLog.upload.notice("⏰ リフレッシュタスクが期限切れになりました")
+            workTask?.cancel()
+            completion.complete(success: false)
         }
-        
-        Task {
+
+        workTask = Task {
             await NetworkService.shared.refreshAllSessionStatus()
-            task.setTaskCompleted(success: true)
+            completion.complete(success: !Task.isCancelled)
         }
     }
     
@@ -157,3 +176,28 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
 // MARK: - Import for iOS 13+
 import BackgroundTasks
+
+/// BGTask の完了通知を一度だけに保証する。
+/// `setTaskCompleted` の二重呼び出しは未定義動作で、クラッシュログに「completed called twice」が出る。
+/// 期限切れハンドラと正常終了は別のスレッドから同時に来るため、フラグの確認と通知を
+/// ロックで囲んで不可分にする。
+@available(iOS 13.0, *)
+final class SingleShotTaskCompletion: @unchecked Sendable {
+    private let task: BGTask
+    private let lock = NSLock()
+    private var isCompleted = false
+
+    init(task: BGTask) {
+        self.task = task
+    }
+
+    func complete(success: Bool) {
+        lock.lock()
+        let alreadyCompleted = isCompleted
+        isCompleted = true
+        lock.unlock()
+
+        guard !alreadyCompleted else { return }
+        task.setTaskCompleted(success: success)
+    }
+}

@@ -11,9 +11,10 @@ class NetworkService: NSObject, ObservableObject {
 
     @Published var activeUploadSessions: [String: UploadSession] = [:]
     
-    // バックグラウンド完了ハンドラー
-    var backgroundCompletionHandler: (() -> Void)?
-    
+    /// BackgroundURLSession の identifier。completion handler の対応付けにも使う。
+    static let backgroundSessionIdentifier = "com.largefileupload.background"
+
+
     // 逐次処理用キュー管理
     private var uploadQueues: [String: UploadQueue] = [:]
     private var currentUploads: [String: String] = [:]
@@ -21,13 +22,9 @@ class NetworkService: NSObject, ObservableObject {
     // タスク監視用プロパティ
     private var activeTaskIds: [String: Int] = [:]  // sessionId -> taskIdentifier
     private var taskStartTimes: [String: Date] = [:]  // sessionId -> 開始時刻
-    private var taskMonitorTimer: Timer?
 
     // アプリ状態管理（重要：MainActor使用を制御）
     private var isAppInBackground = false
-
-    // エラー回数管理用の簡易実装
-    private var errorCounts: [String: Int] = [:]
 
     /// happy-path 永続化のデバウンス管理。sessionId -> 最終 save 時刻。
     /// initial(uploadedChunks==1) と complete は無条件で save、それ以外は
@@ -40,7 +37,7 @@ class NetworkService: NSObject, ObservableObject {
     /// notifyUploadError を発火させない。pause 経由の cancel (session.status == .paused) と同じ扱い。
     private var taskIdsPendingResumeCancel: Set<Int> = []
 
-    /// 上記のすべての可変辞書 (activeTaskIds/taskStartTimes/currentUploads/uploadQueues/errorCounts/
+    /// 上記のすべての可変辞書 (activeTaskIds/taskStartTimes/currentUploads/uploadQueues/
     /// activeUploadSessions) は複数の実行コンテキスト (URLSession delegate queue / Task / Timer)
     /// から触られるため、直列化するための再入可能ロック。
     private let stateLock = NSRecursiveLock()
@@ -104,8 +101,6 @@ class NetworkService: NSObject, ObservableObject {
     }
     
     deinit {
-        // タスク監視タイマーをクリーンアップ
-        stopTaskMonitoring()
         NotificationCenter.default.removeObserver(self)
         AppLog.upload.notice("🧹 [DEINIT] NetworkService リソースをクリーンアップ")
     }
@@ -117,13 +112,17 @@ class NetworkService: NSObject, ObservableObject {
         controlSession = URLSession(configuration: controlConfig)
 
         let backgroundConfig = URLSessionConfiguration.background(
-            withIdentifier: "com.largefileupload.background"
+            withIdentifier: Self.backgroundSessionIdentifier
         )
         // 大容量転送: リソース全体タイムアウトは明示的に7日
         backgroundConfig.timeoutIntervalForResource = 60 * 60 * 24 * 7
         // リクエスト単体タイムアウト: 従量制/低速回線を考慮して5分
         backgroundConfig.timeoutIntervalForRequest = 300
-        backgroundConfig.httpMaximumConnectionsPerHost = 1  // 逐次処理
+        // ホストあたりの同時接続数の上限。同時に開く TCP 接続を抑えて回線を占有しないためのもので、
+        // タスクの実行順序や同時実行数を保証する設定ではない。HTTP/2 では 1 本の接続上で
+        // 複数のリクエストが多重化されるため、厳密な逐次送信の根拠にはできない。
+        // チャンクは互いに独立で冪等なので、順序が前後しても結果は変わらない設計にしている。
+        backgroundConfig.httpMaximumConnectionsPerHost = 1
         backgroundConfig.isDiscretionary = false
         backgroundConfig.sessionSendsLaunchEvents = true
         // バックグラウンドでの Extended idle mode (iOS の TCP 保持を強化)
@@ -178,22 +177,21 @@ class NetworkService: NSObject, ObservableObject {
 
     @objc private func appDidEnterBackground() {
         isAppInBackground = true
-        AppLog.upload.notice("🌙 バックグラウンド移行 - MainActor使用停止、逐次アップロード継続")
-        
-        // バックグラウンドでは過度な監視を停止してiOSに任せる
-        stopTaskMonitoring()
-        AppLog.upload.notice("🛑 [BACKGROUND] タスク監視を停止 - 30秒後はiOSが管理")
+        AppLog.upload.notice("🌙 バックグラウンド移行 - MainActor使用停止、OS 所有タスクが転送を継続")
     }
 
     @objc private func appWillEnterForeground() {
         isAppInBackground = false
+        // 復帰時のサーバ突き合わせは UploadManager 側の reconcileWithServer に一本化する。
+        // ここでも独自に再開処理を走らせると、同じセッションに対して二重に投入が走る。
         AppLog.upload.notice("☀️ フォアグラウンド復帰 - UI更新再開")
-        
-        // フォアグラウンド復帰時のみMainActorでUI更新
-        Task {
-            await refreshAllSessionStatusSafely()
-            await resumeIncompleteUploads() // 中断されたアップロードを再開
-        }
+    }
+
+    /// BackgroundURLSession を確実に生成して delegate を再関連付けする。
+    /// `handleEventsForBackgroundURLSession` から completion handler の登録後に呼ぶ。
+    /// init で既に生成しているので、ここでは singleton の生存を確かめるだけでよい。
+    func activateBackgroundSession() {
+        AppLog.upload.notice("🔗 [BG SESSION] identifier=\(Self.backgroundSessionIdentifier) を再関連付け")
     }
 
     // MARK: - Session Management
@@ -202,6 +200,9 @@ class NetworkService: NSObject, ObservableObject {
         AppLog.upload.notice("📝 セッション作成開始")
         
         let fileInfo = try FileManager.shared.getFileInfo(url: fileURL)
+        // 送信を始める前に容量を判断する。投入の途中で書き込みに失敗すると、
+        // サーバ側にセッションだけ残った中途半端な状態になる。
+        try FileManager.shared.ensureSufficientFreeSpace(forFileSize: fileInfo.size)
         let fileChecksum = try FileManager.shared.calculateFileChecksum(url: fileURL)
         let chunkInfo = FileManager.shared.calculateChunkInfo(fileSize: fileInfo.size)
 
@@ -222,27 +223,20 @@ class NetworkService: NSObject, ObservableObject {
 
         // Resume Bug 対策: Document Picker が渡すセキュリティスコープ付き URL は
         // 当該実行中しか読めない。Force Quit → 再起動後は scope が失われ Resume 時に
-        // readChunk が黙って失敗して PUT が飛ばなかった (=「再開が効かない」バグの真因)。
-        // そこでソースファイルをアプリ所有の Documents/uploads/ にステージングしてから
-        // UploadSession に持たせる。以降 session.fileURL はいつでも読める。
+        // 読み込みが黙って失敗して PUT が飛ばなかった (=「再開が効かない」バグの真因)。
+        // そこでソースをアプリ所有の Documents/uploads/<sessionId>/ にチャンク単位で
+        // 書き出してから UploadSession に持たせる。以降そのチャンクはいつでも読める。
+        // 全体コピーを別に持たないので、ローカル消費はファイルサイズ1つ分に収まる。
         //
         // ステージング失敗時はサーバ側にだけセッションが残る「孤立セッション」を防ぐため、
         // ここで明示的に DELETE してから元のエラーを再送する。
-        let stagedURL: URL
-        do {
-            stagedURL = try FileManager.shared.stageFileForUpload(
-                sourceURL: fileURL,
-                sessionId: response.sessionId
-            )
-        } catch {
-            AppLog.upload.error("⚠️ [ROLLBACK] stageFileForUpload 失敗 → サーバ側セッション削除: \(response.sessionId)")
-            _ = try? await performControlRequest(
-                endpoint: .deleteSession(sessionId: response.sessionId),
-                method: "DELETE",
-                responseType: EmptyResponse.self
-            )
-            throw error
-        }
+        //
+        // 順序に注意する。ステージングは数GBだと時間がかかるので、その最中に
+        // 強制終了されるとサーバにセッションだけが残る。そこでステージング先の
+        // パスはセッションIDから決まることを利用して、先にセッションを組み立てて
+        // 手元に同期的に記録し、そのあとで書き出す。こうしておけば、途中で終了しても
+        // 次回起動時の突き合わせがそのセッションを見つけられる。
+        let stagedURL = try FileManager.shared.stagingDirectory(for: response.sessionId)
 
         let session = UploadSession(
             id: response.sessionId,
@@ -253,6 +247,37 @@ class NetworkService: NSObject, ObservableObject {
             fileChecksum: fileChecksum,
             chunkSize: chunkInfo.chunkSize
         )
+        do {
+            try await UploadManager.shared.registerNewSession(session)
+        } catch {
+            AppLog.upload.error("⚠️ [ROLLBACK] セッションの記録に失敗 → サーバ側セッション削除: \(response.sessionId)")
+            _ = try? await performControlRequest(
+                endpoint: .deleteSession(sessionId: response.sessionId),
+                method: "DELETE",
+                responseType: EmptyResponse.self
+            )
+            throw error
+        }
+
+        do {
+            _ = try FileManager.shared.stageChunksForUpload(
+                sourceURL: fileURL,
+                sessionId: response.sessionId,
+                chunkSize: chunkInfo.chunkSize,
+                totalChunks: chunkInfo.totalChunks
+            )
+        } catch {
+            AppLog.upload.error("⚠️ [ROLLBACK] stageChunksForUpload 失敗 → サーバ側セッション削除: \(response.sessionId)")
+            _ = try? await performControlRequest(
+                endpoint: .deleteSession(sessionId: response.sessionId),
+                method: "DELETE",
+                responseType: EmptyResponse.self
+            )
+            await MainActor.run {
+                UploadManager.shared.discardSession(sessionId: response.sessionId, reason: "staging-failed")
+            }
+            throw error
+        }
 
         // セッション登録（完全に安全な方法）
         // FLAW 4/5 の余波修正: activeUploadSessions と uploadQueues への書き込みは
@@ -347,8 +372,9 @@ class NetworkService: NSObject, ObservableObject {
     /// 実機observed: バックグラウンド中のチャンク到達 0 件 → 復帰の status GET と
     /// 同時に再開 (2026-07-12 サーバログ)。
     ///
-    /// 全タスクを先に投入しておけば、httpMaximumConnectionsPerHost=1 の範囲で
-    /// nsurlsessiond がサスペンド中も順次送信を続ける。
+    /// 全タスクを先に投入しておけば、nsurlsessiond がサスペンド中も送信を続ける。
+    /// httpMaximumConnectionsPerHost=1 は同時接続数を抑えるだけで送信順序は保証しないが、
+    /// チャンクは互いに独立で冪等なので順序が前後しても結果は変わらない。
     /// ladder: temp chunk file が全 pending 分同時に存在する (ピークでファイル
     /// サイズ相当の追加ディスク)。問題になったら投入ウィンドウ制に格上げする。
     private func enqueueAllPendingChunks(session: UploadSession) throws {
@@ -359,17 +385,20 @@ class NetworkService: NSObject, ObservableObject {
         var prepError: Error?
         while let chunkIndex = withState({ queue.getNextChunk() }) {
             do {
+                // 永続化した再送予定が未来なら、その時刻を引き継ぐ。ここを nil で積むと、
+                // Retry-After の待機中に強制終了された場合、再起動直後に指定を破って再送する。
+                let scheduled = session.chunkNextRetryAt[chunkIndex]
+                let earliestBeginDate = (scheduled.map { $0 > Date() } ?? false) ? scheduled : nil
                 let task = try buildUploadTask(
                     session: session,
                     chunkIndex: chunkIndex,
-                    earliestBeginDate: nil
+                    earliestBeginDate: earliestBeginDate
                 )
                 // 追跡辞書 (activeTaskIds/taskStartTimes/currentUploads) はセッション
                 // ごとに 1 エントリなので、一括投入では「最後に投入したタスク」だけを
-                // 保持する。一括投入後のタスクは OS 所有 (httpMaximumConnectionsPerHost=1
-                // で逐次配送) であり、stale 検出や verifyTaskProgress による監視は
-                // ベストエフォート。取りこぼしは resumeSessionFromServer のサーバ同期で
-                // 回収する設計とする。
+                // 保持する。投入後のタスクは OS 所有なので、クライアント側の追跡は
+                // ベストエフォートでよい。取りこぼしは起動時とネットワーク復旧時の
+                // サーバ同期で回収する設計とする。
                 withState {
                     activeTaskIds[session.id] = task.taskIdentifier
                     taskStartTimes[session.id] = Date()
@@ -403,110 +432,6 @@ class NetworkService: NSObject, ObservableObject {
         }
     }
 
-    private func processNextChunk(session: UploadSession) async throws {
-        guard let queue = uploadQueues[session.id] else {
-            AppLog.upload.notice("⚠️ アップロードキュー \(session.id) が見つかりません")
-            return
-        }
-        
-        guard let nextChunkIndex = queue.getNextChunk() else {
-            AppLog.upload.notice("✅ 全チャンク送信完了: \(session.fileName)")
-            return
-        }
-        
-        queue.setProcessing(true)
-        AppLog.upload.notice("📤 逐次処理 - チャンク \(nextChunkIndex + 1)/\(session.totalChunks) 送信開始")
-        
-        try await uploadSingleChunkSequentially(
-            session: session,
-            chunkIndex: nextChunkIndex
-        )
-    }
-
-    private func uploadSingleChunkSequentially(
-        session: UploadSession,
-        chunkIndex: Int
-    ) async throws {
-        let taskId = "\(session.id)_\(chunkIndex)"
-        
-        AppLog.upload.notice("🚀 逐次送信 - セッション \(session.id) チャンク \(chunkIndex)")
-
-        withState {
-            currentUploads[session.id] = taskId
-        }
-
-        do {
-            let chunkData = try FileManager.shared.readChunk(
-                from: session.fileURL,
-                chunkIndex: chunkIndex,
-                chunkSize: session.chunkSize
-            )
-            let checksum = FileManager.shared.calculateChecksum(data: chunkData)
-
-            let tempURL = try createTemporaryChunkFile(
-                data: chunkData,
-                sessionId: session.id,
-                chunkIndex: chunkIndex
-            )
-
-            var request = URLRequest(
-                url: APIEndpoint.uploadChunk(
-                    sessionId: session.id,
-                    chunkIndex: chunkIndex
-                ).url
-            )
-            request.httpMethod = "PUT"
-            request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
-            request.setValue(checksum, forHTTPHeaderField: "X-Chunk-Checksum")
-
-            let uploadTask = backgroundSession.uploadTask(with: request, fromFile: tempURL)
-            
-            // タスク監視情報を記録
-            withState {
-                activeTaskIds[session.id] = uploadTask.taskIdentifier
-                taskStartTimes[session.id] = Date()
-            }
-            
-            uploadTask.resume()
-
-            AppLog.upload.notice("📤 逐次送信タスク開始 - チャンク \(chunkIndex) (TaskID: \(uploadTask.taskIdentifier))")
-            AppLog.upload.notice("🌐 [NETWORK CHECK] 現在のネットワーク状態: \(NetworkMonitor.shared.connectionType.displayName)")
-            // 追加の DispatchQueue-based 監視は data race を招くため廃止。
-            // BackgroundURLSession の delegate 通知に任せる (iOS 側で管理される)。
-
-        } catch {
-            withState {
-                uploadQueues[session.id]?.setProcessing(false)
-                currentUploads.removeValue(forKey: session.id)
-            }
-            AppLog.upload.notice("❌ チャンク \(chunkIndex) 逐次送信準備失敗: \(error)")
-            
-            // エラー時の再試行処理（Sendable問題を回避するためsessionIdを事前キャプチャ）
-            let capturedSessionId = session.id
-            Task {
-                await handleChunkUploadErrorSafely(
-                    sessionId: capturedSessionId,
-                    chunkIndex: chunkIndex,
-                    error: error
-                )
-            }
-            
-            throw error
-        }
-    }
-
-    private func createTemporaryChunkFile(
-        data: Data,
-        sessionId: String,
-        chunkIndex: Int
-    ) throws -> URL {
-        let tempDir = Foundation.FileManager.default.temporaryDirectory
-        let fileName = "chunk_\(sessionId)_\(chunkIndex).dat"
-        let tempURL = tempDir.appendingPathComponent(fileName)
-        
-        try data.write(to: tempURL)
-        return tempURL
-    }
 
     // MARK: - Session Status
 
@@ -563,7 +488,7 @@ class NetworkService: NSObject, ObservableObject {
         for task in osTasks {
             if let url = task.originalRequest?.url,
                Self.extractSessionId(from: url) == session.id {
-                withState { taskIdsPendingResumeCancel.insert(task.taskIdentifier) }
+                withState { _ = taskIdsPendingResumeCancel.insert(task.taskIdentifier) }
                 task.cancel()
             }
         }
@@ -588,6 +513,17 @@ class NetworkService: NSObject, ObservableObject {
         }
     }
 
+    /// サーバが返す RFC3339 形式の時刻を Date にする。小数秒の有無どちらも受ける。
+    static func parseServerDate(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFraction.date(from: raw) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: raw)
+    }
+
     /// missingChunks からセッションの uploadedChunks を再構成する pure 関数 (テスト対象)。
     static func syncUploadedChunks(session: UploadSession, missingChunks: [Int], totalChunks: Int) {
         let missing = Set(missingChunks)
@@ -609,7 +545,7 @@ class NetworkService: NSObject, ObservableObject {
         //    後段の `activeUploadSessions[sessionId]` guard が失敗し、
         //    ユーザ向けエラー通知は上がらない (FLAW 4 対策)。
         withState {
-            activeUploadSessions.removeValue(forKey: sessionId)
+            _ = activeUploadSessions.removeValue(forKey: sessionId)
         }
 
         // ② OS 所有の live タスクを cancel (v2 追加)
@@ -631,26 +567,52 @@ class NetworkService: NSObject, ObservableObject {
         }
 
         // ⑤ temp file GC (v2 追加)
-        cleanupSessionTempFiles(sessionId: sessionId)
 
         AppLog.upload.notice("✅ セッション削除完了: \(sessionId)")
     }
 
-    /// セッション固有の temp file を全削除 (v2)
-    private func cleanupSessionTempFiles(sessionId: String) {
-        let tempDir = Foundation.FileManager.default.temporaryDirectory
-        let files = (try? Foundation.FileManager.default.contentsOfDirectory(atPath: tempDir.path)) ?? []
-        let prefix = "chunk_\(sessionId)_"
-        for name in files where name.hasPrefix(prefix) {
-            try? Foundation.FileManager.default.removeItem(at: tempDir.appendingPathComponent(name))
-        }
+    /// 送信中のどのセッションにも属さないステージングを削除する。
+    /// 強制終了や破棄で取り残されたチャンク群がローカル容量を占め続けるのを防ぐ。
+    /// BGProcessingTask から定期的に呼ぶ後始末。
+    func cleanupOrphanedStagedSessions() {
+        let liveSessionIds = withState { Set(activeUploadSessions.keys) }
+        FileManager.shared.cleanupOrphanedStagingDirectories(activeSessionIds: liveSessionIds)
     }
 
     private func refreshAllSessionStatusSafely() async {
         for (sessionId, session) in activeUploadSessions {
             do {
                 let status = try await getSessionStatus(sessionId: sessionId)
-                
+                session.serverExpiresAt = NetworkService.parseServerDate(status.expiresAt)
+
+                // サーバが完了と言っているならそれを真として取り込む。
+                // 結合はサーバ側で自動的に走るため、アプリが POST /complete を
+                // 呼べないままバックグラウンドで眠っていた場合の回収経路がここになる。
+                if status.status == UploadStatus.completed.rawValue {
+                    NetworkService.syncUploadedChunks(
+                        session: session,
+                        missingChunks: status.missingChunks,
+                        totalChunks: status.totalChunks
+                    )
+                    adoptServerCompletion(session: session)
+                    continue
+                }
+
+                // サーバの error でも、やり直しで回復し得る失敗と恒久的な失敗は分けて扱う。
+                // 一時的な I/O 失敗まで終端にすると、再確認すれば済む状況から戻れなくなる。
+                if status.status == UploadStatus.error.rawValue {
+                    if status.finalizeFatal == true {
+                        adoptServerFailure(
+                            session: session,
+                            message: status.finalizeError ?? "サーバ側でアップロードが失敗しました"
+                        )
+                    } else {
+                        AppLog.upload.notice("🔁 session=\(sessionId) はサーバ側で一時的に失敗 → 完了確認を再試行")
+                        try? await completeUpload(session: session)
+                    }
+                    continue
+                }
+
                 // 完全に安全な状態更新
                 updateSessionStateSafely {
                     session.uploadedChunks = Set(0..<status.totalChunks)
@@ -658,10 +620,12 @@ class NetworkService: NSObject, ObservableObject {
                     session.updateProgress()
 
                     if session.status != .completed && session.status != .completing {
-                        if status.status == "ready" && session.status == .uploading {
+                        // combining はサーバが結合を実行している最中。送信は終わっているので
+                        // ユーザーには「完了処理中」として見せる。
+                        if status.status == "combining" {
+                            session.updateStatus(.completing)
+                        } else if status.status == "ready" && session.status == .uploading {
                             session.updateStatus(.ready)
-                        } else if status.status == "completed" {
-                            session.updateStatus(.completed)
                         }
                     }
                 }
@@ -673,18 +637,111 @@ class NetworkService: NSObject, ObservableObject {
 
     // MARK: - Upload Completion
 
+    /// 結合結果を確認する冪等な問い合わせ。
+    ///
+    /// 結合そのものは最終チャンクが届いた時点でサーバ側が自動的に始めている。
+    /// この POST は「終わったか」を尋ねるだけなので、アプリがバックグラウンドで
+    /// サスペンドされていて呼べなくても、ファイルはサーバ側で確定する。
+    /// まだ結合中なら status は "combining" のまま返るため、その場合は .completing で待つ。
+    /// 完了の取り込みは refreshAllSessionStatus / reconcileWithServer 側が拾う。
     func completeUpload(session: UploadSession) async throws {
-        AppLog.upload.notice("🏁 アップロード完了処理開始: \(session.id)")
-        
+        AppLog.upload.notice("🏁 アップロード完了確認開始: \(session.id)")
+
         updateSessionSafely(session) { session in
             session.updateStatus(.completing)
         }
 
-        let response = try await performControlRequest(
-            endpoint: .completeUpload(sessionId: session.id),
-            method: "POST",
-            responseType: CompleteResponse.self
-        )
+        let response: CompleteResponse
+        do {
+            response = try await performControlRequest(
+                endpoint: .completeUpload(sessionId: session.id),
+                method: "POST",
+                responseType: CompleteResponse.self
+            )
+        } catch let NetworkError.httpError(code, message) where (400..<500).contains(code) {
+            // 整合性チェック失敗 (422) などの恒久的な失敗。ここで終端に落とさないと
+            // .completing のまま完了も失敗もせず、確認を繰り返すだけの状態で止まる。
+            AppLog.upload.error("❌ 完了確認が恒久的に失敗 (HTTP \(code)): \(message)")
+            adoptServerFailure(session: session, message: message)
+            throw NetworkError.httpError(code, message)
+        }
+
+        guard response.status == UploadStatus.completed.rawValue else {
+            AppLog.upload.notice("⏳ サーバ側は結合中 (status=\(response.status)): \(session.id)")
+            // ここで戻るだけだと .completing のまま次の偶発的な突き合わせを待つことになる。
+            // 結合が終わるまでの確認を自分で予約しておく。
+            scheduleCombiningFollowUp(session: session)
+            return
+        }
+
+        adoptServerCompletion(session: session)
+        AppLog.upload.notice("✅ アップロード完了: \(response.filePath)")
+    }
+
+    /// 結合中のセッションについて、終端に達するまで状態を確認し続ける。
+    /// フォアグラウンドで動いている間の取りこぼしを防ぐための上限付きポーリング。
+    /// アプリが眠ってこれが止まっても、起動時と BGProcessingTask の突き合わせが拾い直す。
+    private func scheduleCombiningFollowUp(session: UploadSession) {
+        let sessionId = session.id
+        Task {
+            let deadline = Date().addingTimeInterval(combiningFollowUpTimeout)
+            while Date() < deadline {
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                guard let status = try? await getSessionStatus(sessionId: sessionId) else { continue }
+
+                if status.status == UploadStatus.completed.rawValue {
+                    NetworkService.syncUploadedChunks(
+                        session: session,
+                        missingChunks: status.missingChunks,
+                        totalChunks: status.totalChunks
+                    )
+                    adoptServerCompletion(session: session)
+                    return
+                }
+                if status.status == UploadStatus.error.rawValue && status.finalizeFatal == true {
+                    adoptServerFailure(
+                        session: session,
+                        message: status.finalizeError ?? "サーバ側でアップロードが失敗しました"
+                    )
+                    return
+                }
+            }
+            AppLog.upload.notice("⏳ [FOLLOW UP] session=\(sessionId) の結合確認を打ち切り。次の突き合わせに委ねる")
+        }
+    }
+
+    /// 結合完了を追いかける上限。これを超えたら起動時や BGProcessingTask の突き合わせに任せる。
+    private var combiningFollowUpTimeout: TimeInterval { 300 }
+
+    /// サーバが恒久的な失敗と言っている状態を取り込む。
+    /// 送信済みチャンクは手元に残したまま終端の .error に落とし、利用者に見せる。
+    func adoptServerFailure(session: UploadSession, message: String) {
+        guard session.status != .error && session.status != .completed else { return }
+
+        updateSessionSafely(session) { session in
+            session.autoResumeBlocked = true
+            session.setError(message)
+        }
+        withState {
+            uploadQueues.removeValue(forKey: session.id)
+            currentUploads.removeValue(forKey: session.id)
+            activeTaskIds.removeValue(forKey: session.id)
+            taskStartTimes.removeValue(forKey: session.id)
+        }
+        let sessionId = session.id
+        Task {
+            await UploadManager.shared.notifyUploadError(
+                sessionId: sessionId,
+                error: NetworkError.fileError(message)
+            )
+        }
+    }
+
+    /// サーバが完了と言っている状態をクライアントに取り込む。
+    /// POST /complete の応答からでも GET /status のポーリングからでも同じ経路を通す。
+    /// 二度呼ばれても害が無いように、完了済みなら何もしない。
+    func adoptServerCompletion(session: UploadSession) {
+        guard session.status != .completed else { return }
 
         updateSessionSafely(session) { session in
             session.updateStatus(.completed)
@@ -693,15 +750,19 @@ class NetworkService: NSObject, ObservableObject {
         withState {
             uploadQueues.removeValue(forKey: session.id)
             currentUploads.removeValue(forKey: session.id)
+            activeTaskIds.removeValue(forKey: session.id)
+            taskStartTimes.removeValue(forKey: session.id)
         }
 
-        // ステージングした Documents/uploads/ 配下のコピーは完了後に不要なので削除
-        FileManager.shared.cleanupStagedFile(sessionId: session.id, fileURL: session.fileURL)
-
-        // UploadManagerに完了を通知
+        // 順序が重要。完了を履歴として保存し終えてから再送材料を消す。
+        // 先に消すと、保存前に強制終了された場合に「送信中のまま復元されるのに
+        // 送るチャンクが無い」状態になり、そのセッションは復旧できない。
         UploadManager.shared.notifyUploadCompletion(sessionId: session.id)
-        
-        AppLog.upload.notice("✅ アップロード完了: \(response.filePath)")
+    }
+
+    /// 完了が履歴として保存された後に呼ばれ、再送材料を片付ける。
+    func cleanupAfterPersistedCompletion(session: UploadSession) {
+        FileManager.shared.cleanupStagedFile(sessionId: session.id, fileURL: session.fileURL)
     }
 
     // MARK: - Control Request Helper
@@ -771,15 +832,12 @@ class NetworkService: NSObject, ObservableObject {
 extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSessionDataDelegate {
     
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
-        AppLog.upload.notice("🔔 BackgroundURLSession - 全タスク完了")
-        
-        // バックグラウンド完了ハンドラーのみMainThreadで実行
-        if let handler = backgroundCompletionHandler {
-            DispatchQueue.main.async {
-                handler()
-                self.backgroundCompletionHandler = nil
-            }
-        }
+        let identifier = session.configuration.identifier ?? Self.backgroundSessionIdentifier
+        AppLog.upload.notice("🔔 BackgroundURLSession - 全タスク完了: \(identifier)")
+
+        // 登録済みなら即座に、未登録なら登録された時点でレジストリが呼び戻す。
+        // ここで nil を見て黙って捨てると、OS へ返す completion handler が呼ばれないまま残る。
+        BackgroundSessionCompletionRegistry.shared.finish(identifier: identifier)
     }
 
     func urlSession(
@@ -834,7 +892,6 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
                     chunkIndex: chunkIndex,
                     session: uploadSession
                 )
-                cleanupTemporaryFile(sessionId: sessionId, chunkIndex: chunkIndex)
             }
             return
         }
@@ -863,9 +920,6 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
         if isCancel && (uploadSession.status == .paused || isPendingResumeCancel) {
             let reason = isPendingResumeCancel ? "resume-cleanup" : "paused"
             AppLog.upload.notice("⏸ [BENIGN CANCEL/\(reason)] session=\(sessionId) chunk=\(chunkIndex ?? -1) error 通知せずに終了")
-            if let chunkIndex = chunkIndex {
-                cleanupTemporaryFile(sessionId: sessionId, chunkIndex: chunkIndex)
-            }
             return
         }
 
@@ -877,13 +931,18 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
                     httpResp?.statusCode ?? -1,
                     "HTTP\(httpResp?.statusCode ?? -1) - チャンク\(chunkIndex)アップロード失敗"
                 )
+                // 401 や 413 のような恒久的な拒否は、投げ直しても同じ結果になる。
+                // 自動再開を止めないと、起動やフォアグラウンド復帰のたびに同じ PUT を繰り返す。
+                if let statusCode = httpResp?.statusCode, (400..<500).contains(statusCode) {
+                    withState { uploadSession.autoResumeBlocked = true }
+                    UploadManager.shared.saveActiveStateSync()
+                }
                 Task {
                     await UploadManager.shared.notifyUploadError(
                         sessionId: sessionId,
                         error: notifiedError
                     )
                 }
-                cleanupTemporaryFile(sessionId: sessionId, chunkIndex: chunkIndex)
             }
             return
 
@@ -913,6 +972,11 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
     ) {
         // バックグラウンド時も完全安全：MainActor使用禁止
         session.markChunkUploaded(chunkIndex)
+        // 送れたチャンクの再送予定は不要。残しておくと次回起動時に余計な待機が入る。
+        withState {
+            session.chunkRetryCounts.removeValue(forKey: chunkIndex)
+            session.chunkNextRetryAt.removeValue(forKey: chunkIndex)
+        }
 
         AppLog.upload.notice("📊 [BACKGROUND SAFE] セッション \(sessionId): \(session.uploadedChunks.count)/\(session.totalChunks) 完了")
 
@@ -991,13 +1055,6 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
         return nil
     }
 
-    private func cleanupTemporaryFile(sessionId: String, chunkIndex: Int) {
-        let tempDir = Foundation.FileManager.default.temporaryDirectory
-        let fileName = "chunk_\(sessionId)_\(chunkIndex).dat"
-        let tempURL = tempDir.appendingPathComponent(fileName)
-        
-        try? Foundation.FileManager.default.removeItem(at: tempURL)
-    }
     
     // MARK: - Error Handling Methods
     
@@ -1017,45 +1074,7 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
         scheduleChunkRetry(sessionId: sessionId, chunkIndex: chunkIndex, decision: decision)
     }
 
-    // エラー回数管理メソッド (v2 は UploadSession.chunkRetryCounts に一本化、以下は互換用)
-    private func getErrorCount(for key: String) -> Int {
-        return errorCounts[key] ?? 0
-    }
-
-    private func incrementErrorCount(for key: String) {
-        errorCounts[key] = getErrorCount(for: key) + 1
-    }
-
-    private func clearErrorCount(for key: String) {
-        errorCounts.removeValue(forKey: key)
-    }
     
-    // MARK: - Foreground Resume
-    
-    func resumeIncompleteUploads() async {
-        AppLog.upload.notice("🔄 [GENTLE RESUME] 不完全なアップロードの穏やかなチェックを実行")
-        
-        for (sessionId, session) in activeUploadSessions {
-            guard let queue = uploadQueues[sessionId] else { continue }
-            
-            // 長時間停止しているセッションのみ、穏やかに再開を試みる
-            if session.status == .uploading && !queue.isCurrentlyProcessing && queue.hasRemainingChunks {
-                AppLog.upload.notice("🔄 [GENTLE RESUME] セッション \(sessionId) を穏やかに再開試行")
-                
-                // エラーがあっても、BackgroundURLSessionの自然復旧を信頼
-                do {
-                    try enqueueAllPendingChunks(session: session)
-                } catch {
-                    AppLog.upload.notice("⚠️ [GENTLE RESUME] セッション \(sessionId) の穏やかな再開に失敗: \(error.localizedDescription)")
-                    // 再開に失敗しても、BackgroundURLSessionの自然復旧を信頼
-                }
-            } else {
-                AppLog.upload.notice("✅ [GENTLE RESUME] セッション \(sessionId) は正常動作中")
-            }
-        }
-        
-        AppLog.upload.notice("✅ [GENTLE RESUME] 穏やかなチェック完了")
-    }
     
     // MARK: - Network Callbacks Setup
     
@@ -1090,313 +1109,83 @@ extension NetworkService: URLSessionDelegate, URLSessionTaskDelegate, URLSession
         AppLog.upload.notice("🔗 [NETWORK CALLBACKS] ネットワーク変更時の自動再開処理を設定完了")
     }
     
-    /// ネットワーク切り替え時の処理
-    private func handleNetworkTransition(from previousType: NetworkMonitor.ConnectionType, to currentType: NetworkMonitor.ConnectionType) async {
-        AppLog.upload.notice("🔄 [NETWORK TRANSITION] \(previousType.displayName) → \(currentType.displayName) での積極的な監視を開始")
-        
-        // ネットワーク切り替え時は、即座タスク状態を確認
-        
-        // 1. 即座タスク状態確認
-        await immediateTaskStateCheck(reason: "ネットワーク切り替え")
-        
-        // 2. 10秒待機後に積極的なタスク失効検出と復旧
-        try? await Task.sleep(nanoseconds: 10_000_000_000) // 10秒待機
-        await forceCheckStaleTasksAfterNetworkTransition()
-        
-        // 3. 監視タイマーを強化（一時的に間隔を短縮）
-        enhanceTaskMonitoringTemporarily()
+    /// ネットワーク切り替え時の処理。
+    ///
+    /// やるのは「OS 側のタスク一覧と手元の状態を突き合わせ、止まっていたら積み直す」だけです。
+    /// 待ってから確認する作りにはしません。Task.sleep による待機はアプリがサスペンドされた
+    /// 瞬間に消えるため、切り替え直後にバックグラウンドへ回ると確認そのものが起きなくなります。
+    private func handleNetworkTransition(
+        from previousType: NetworkMonitor.ConnectionType,
+        to currentType: NetworkMonitor.ConnectionType
+    ) async {
+        AppLog.upload.notice("🔄 [NETWORK TRANSITION] \(previousType.displayName) → \(currentType.displayName)")
+        await recoverStalledSessions(reason: "ネットワーク切り替え")
     }
-    
-    /// 即座タスク状態確認
-    private func immediateTaskStateCheck(reason: String) async {
-        AppLog.upload.notice("🔍 [IMMEDIATE CHECK] \(reason)による即座タスク状態確認を開始")
-        
-        let tasks = await backgroundSession.allTasks
-        
-        for (sessionId, taskId) in activeTaskIds {
-            var foundTask: URLSessionTask?
-            
-            for task in tasks {
-                if task.taskIdentifier == taskId {
-                    foundTask = task
-                    break
-                }
-            }
-            
-            if let task = foundTask {
-                AppLog.upload.notice("🔍 [IMMEDIATE CHECK] セッション(\(sessionId)) TaskID(\(taskId)) 状態: \(task.state.description)")
-                AppLog.upload.notice("🔍 [IMMEDIATE CHECK] 送信バイト: \(task.countOfBytesSent)/\(task.countOfBytesExpectedToSend)")
-                
-                // タスクが停止・キャンセル状態の場合は即座復旧
-                if task.state == .suspended {
-                    AppLog.upload.notice("⚠️ [IMMEDIATE CHECK] TaskID(\(taskId)) が一時停止 - 再開を試行")
-                    task.resume()
-                } else if task.state == .canceling || task.state == .completed {
-                    AppLog.upload.notice("⚠️ [IMMEDIATE CHECK] TaskID(\(taskId)) が異常状態 - 即座復旧が必要")
-                    
-                    await cleanupStaleTask(sessionId: sessionId)
-                    
-                    if let session = activeUploadSessions[sessionId] {
-                        do {
-                            try await processNextChunk(session: session)
-                            AppLog.upload.notice("✅ [IMMEDIATE CHECK] 即座復旧が完了: \(sessionId)")
-                        } catch {
-                            AppLog.upload.notice("❌ [IMMEDIATE CHECK] 即座復旧に失敗: \(sessionId) - \(error)")
-                        }
-                    }
-                }
-            } else {
-                AppLog.upload.notice("❌ [IMMEDIATE CHECK] セッション(\(sessionId)) TaskID(\(taskId)) が納失 - 即座復旧が必要")
-                
-                await cleanupStaleTask(sessionId: sessionId)
-                
-                if let session = activeUploadSessions[sessionId] {
-                    do {
-                        try await processNextChunk(session: session)
-                        AppLog.upload.notice("✅ [IMMEDIATE CHECK] 納失タスクの即座復旧が完了: \(sessionId)")
-                    } catch {
-                        AppLog.upload.notice("❌ [IMMEDIATE CHECK] 納失タスクの復旧に失敗: \(sessionId) - \(error)")
-                    }
-                }
-            }
-        }
-        
-        AppLog.upload.notice("✅ [IMMEDIATE CHECK] \(reason)による即座タスク状態確認が完了")
-    }
-    
-    /// ネットワーク切り替え後の積極的なタスク検出
-    private func forceCheckStaleTasksAfterNetworkTransition() async {
-        let currentTime = Date()
-        let networkTransitionTimeout: TimeInterval = 10.0  // ネットワーク切り替え時は10秒で失効とみなす
-        
-        AppLog.upload.notice("🔍 [FORCE CHECK] ネットワーク切り替え後の積極的なタスク検出を開始")
-        
-        for (sessionId, startTime) in taskStartTimes {
-            let elapsedTime = currentTime.timeIntervalSince(startTime)
-            
-            // ネットワーク切り替え時は通常より省いタイムアウトで失効検出
-            if elapsedTime > networkTransitionTimeout {
-                guard let session = activeUploadSessions[sessionId],
-                      let _ = uploadQueues[sessionId] else {
-                    continue
-                }
-                
-                AppLog.upload.notice("⚠️ [TRANSITION STALE] ネットワーク切り替えでタスク失効: セッション \(sessionId) (\(Int(elapsedTime))秒経過, 閾値: 10秒)")
-                AppLog.upload.notice("🔄 [TRANSITION RECOVERY] ネットワーク切り替え復旧を開始")
-                
-                // 失効したタスクをクリーンアップ
-                await cleanupStaleTask(sessionId: sessionId)
-                
-                // 新しいタスクで再開
-                do {
-                    try await processNextChunk(session: session)
-                    AppLog.upload.notice("✅ [TRANSITION RECOVERY] ネットワーク切り替え復旧が完了: \(sessionId)")
-                } catch {
-                    AppLog.upload.notice("❌ [TRANSITION RECOVERY] ネットワーク切り替え復旧に失敗: \(sessionId) - \(error)")
-                }
-            }
-        }
-        
-        AppLog.upload.notice("✅ [FORCE CHECK] ネットワーク切り替え後の積極的なタスク検出が完了")
-    }
-    
-    /// 一時的にタスク監視を強化
-    private func enhanceTaskMonitoringTemporarily() {
-        // Timer ベースの強化監視は data race の原因となるため無効化。
-        // ネットワーク切り替え検知はネットワークコールバック側で処理する。
-    }
-    
+
     /// 接続復旧時の処理
     private func handleConnectionRecovery() async {
-        AppLog.upload.notice("📶 [CONNECTION RECOVERY] 接続復旧後の軽量チェックを開始")
-        
-        // 少し待機してから軽量な状態確認
-        try? await Task.sleep(nanoseconds: 3_000_000_000) // 3秒待機
-        
-        await checkSessionStatusQuietly()
+        AppLog.upload.notice("📶 [CONNECTION RECOVERY] 接続復旧を検出")
+        await recoverStalledSessions(reason: "接続復旧")
     }
-    
-    // MARK: - Lightweight Network Handling
-    
-    /// 軽量なセッション状態確認（強制介入なし）
-    private func checkSessionStatusQuietly() async {
-        AppLog.upload.notice("🔍 [QUIET CHECK] アクティブセッションの軽量チェックを実行")
-        
-        for (sessionId, session) in activeUploadSessions {
-            guard let queue = uploadQueues[sessionId] else { continue }
-            
-            // アップロードが長時間停止している場合のみ、優しく再開
-            if session.status == .uploading && 
-               !queue.isCurrentlyProcessing && 
-               queue.hasRemainingChunks {
-                
-                AppLog.upload.notice("🔄 [GENTLE RESUME] セッション \(sessionId) を優しく再開")
-                
-                // 強制的ではなく、優しく再開を試みる
-                do {
-                    try await processNextChunk(session: session)
-                } catch {
-                    AppLog.upload.notice("⚠️ [GENTLE RESUME] セッション \(sessionId) の優しい再開に失敗: \(error.localizedDescription)")
-                    // エラーがあっても、BackgroundURLSessionの自然復旧を信頼
-                }
-            } else {
-                AppLog.upload.notice("✅ [QUIET CHECK] セッション \(sessionId) は正常状態")
+
+    /// OS 側に生きているタスクが1本も無い送信中セッションを見つけて、残チャンクを積み直す。
+    ///
+    /// 復旧は必ず「残チャンクの全件一括投入」で行う。1 個ずつ積み直す方式に戻すと、
+    /// 復旧直後にアプリがサスペンドされた時点でその 1 個を送り切って転送が止まる。
+    /// 送信中のタスクはキャンセルしない。OS が既に送っているものを止める理由が無い。
+    /// 何が未送信かは手元の記録ではなくサーバに聞く。手元だけで判断すると、既に届いている
+    /// チャンクを送り直すことになる。
+    private func recoverStalledSessions(reason: String) async {
+        let liveKeys = await liveTaskKeys()
+        let sessions = withState { activeUploadSessions }
+
+        for (sessionId, session) in sessions {
+            guard session.status == .uploading else { continue }
+
+            let liveChunks = NetworkService.liveChunkIndices(for: sessionId, in: liveKeys)
+            if !liveChunks.isEmpty {
+                AppLog.upload.notice("✅ [RECOVER/\(reason)] session=\(sessionId) は OS 側で \(liveChunks.count) 件送信中 → 介入しない")
+                continue
             }
-        }
-        
-        AppLog.upload.notice("✅ [QUIET CHECK] 軽量チェック完了")
-    }
-    
-    // MARK: - Task Monitoring and Recovery
-    
-    /// タスク監視タイマーを開始
-    private func startTaskMonitoringIfNeeded() {
-        // Timer ベースのタスク監視は data race の原因となるため無効化。
-        // BackgroundURLSession の delegate 通知に委譲する。
-    }
-    
-    /// 停止中のタスク監視タイマーを停止
-    private func stopTaskMonitoring() {
-        taskMonitorTimer?.invalidate()
-        taskMonitorTimer = nil
-        AppLog.upload.notice("🔍 [TASK MONITOR] タスク監視タイマーを停止")
-    }
-    
-    /// 失効したタスクを検出して自動復旧
-    private func checkForStaleTasksAndRecover() async {
-        let currentTime = Date()
-        let timeoutInterval: TimeInterval = 60.0  // 60秒でタスク失効とみなす
-        
-        for (sessionId, startTime) in taskStartTimes {
-            let elapsedTime = currentTime.timeIntervalSince(startTime)
-            
-            // 60秒以上経過したタスクを失効とみなす
-            if elapsedTime > timeoutInterval {
-                guard let session = activeUploadSessions[sessionId],
-                      let _ = uploadQueues[sessionId] else {
+
+            do {
+                let status = try await getSessionStatus(sessionId: sessionId)
+                if status.missingChunks.isEmpty {
+                    AppLog.upload.notice("✅ [RECOVER/\(reason)] session=\(sessionId) は全チャンク到達済み → 結合結果を確認")
+                    NetworkService.syncUploadedChunks(
+                        session: session,
+                        missingChunks: [],
+                        totalChunks: session.totalChunks
+                    )
+                    try await completeUpload(session: session)
                     continue
                 }
-                
-                AppLog.upload.notice("⚠️ [STALE TASK] セッション \(sessionId) のタスクが失効 (\(Int(elapsedTime))秒経過, 闾値: 60秒)")
-                AppLog.upload.notice("🔄 [RECOVERY] 失効タスクを検出 - 自動復旧を開始")
-                
-                // 失効したタスクをクリーンアップ
-                await cleanupStaleTask(sessionId: sessionId)
-                
-                // 新しいタスクで再開
-                do {
-                    try await processNextChunk(session: session)
-                    AppLog.upload.notice("✅ [RECOVERY] セッション \(sessionId) の自動復旧が完了")
-                } catch {
-                    AppLog.upload.notice("❌ [RECOVERY] セッション \(sessionId) の自動復旧に失敗: \(error)")
-                }
+
+                AppLog.upload.notice("🔄 [RECOVER/\(reason)] session=\(sessionId) 残 \(status.missingChunks.count) チャンクを一括投入")
+                registerForDelegateCallbacks(
+                    session: session,
+                    status: status,
+                    pendingChunks: status.missingChunks
+                )
+                try enqueueAllPendingChunks(session: session)
+            } catch {
+                // 投入や問い合わせに失敗しても、リトライ予定は OS 側に預けてあるので諦めてよい。
+                // 次のフォアグラウンド復帰か BGProcessingTask の reconcile が拾い直す。
+                AppLog.upload.notice("⚠️ [RECOVER/\(reason)] session=\(sessionId) の復旧に失敗: \(error.localizedDescription)")
             }
         }
-        
-        // アクティブなタスクがない場合は監視を停止
-        if activeTaskIds.isEmpty {
-            stopTaskMonitoring()
-        }
     }
-    
-    /// 失効したタスクをクリーンアップ
-    private func cleanupStaleTask(sessionId: String) async {
-        withState {
-            activeTaskIds.removeValue(forKey: sessionId)
-            taskStartTimes.removeValue(forKey: sessionId)
-            currentUploads.removeValue(forKey: sessionId)
-            uploadQueues[sessionId]?.setProcessing(false)
-        }
-        AppLog.upload.notice("🧹 [CLEANUP] セッション \(sessionId) の失効タスクをクリーンアップ完了")
-    }
-    
-    /// タスクの進捗を確認
-    private func verifyTaskProgress(taskId: Int, sessionId: String, chunkIndex: Int) async {
-        AppLog.upload.notice("🔍 [TASK VERIFY] TaskID(\(taskId)) の進捗を確認中...")
-        
-        // BackgroundSessionのアクティブタスクを取得
+
+    /// OS 所有タスクの (sessionId:chunkIndex) キー集合を取る。
+    private func liveTaskKeys() async -> Set<String> {
         let tasks = await backgroundSession.allTasks
-        
-        var foundTask: URLSessionTask?
+        var keys: Set<String> = []
         for task in tasks {
-            if task.taskIdentifier == taskId {
-                foundTask = task
-                break
-            }
+            guard let url = task.originalRequest?.url,
+                  let key = Self.extractSessionChunkKey(from: url) else { continue }
+            keys.insert(key)
         }
-        
-        if let task = foundTask {
-            AppLog.upload.notice("🔍 [TASK VERIFY] TaskID(\(taskId)) 状態: \(task.state.description)")
-            AppLog.upload.notice("🔍 [TASK VERIFY] TaskID(\(taskId)) 送信バイト: \(task.countOfBytesSent)/\(task.countOfBytesExpectedToSend)")
-            
-            // タスクが停止している場合の該断
-            if task.state == .suspended {
-                AppLog.upload.notice("⚠️ [TASK VERIFY] TaskID(\(taskId)) が一時停止状態 - 再開を試行")
-                task.resume()
-            } else if task.state == .canceling || task.state == .completed {
-                AppLog.upload.notice("⚠️ [TASK VERIFY] TaskID(\(taskId)) が異常状態 (\(task.state.description)) - 即座復旧が必要")
-                
-                // 即座復旧を実行
-                await cleanupStaleTask(sessionId: sessionId)
-                
-                if let session = activeUploadSessions[sessionId] {
-                    do {
-                        try await processNextChunk(session: session)
-                        AppLog.upload.notice("✅ [TASK VERIFY] 即座復旧が完了: \(sessionId)")
-                    } catch {
-                        AppLog.upload.notice("❌ [TASK VERIFY] 即座復旧に失敗: \(sessionId) - \(error)")
-                    }
-                }
-            } else {
-                AppLog.upload.notice("✅ [TASK VERIFY] TaskID(\(taskId)) は正常状態 (\(task.state.description))")
-            }
-        } else {
-            AppLog.upload.notice("❌ [TASK VERIFY] TaskID(\(taskId)) が見つかりません - タスクが失効した可能性")
-            
-            // タスクが見つからない場合は即座復旧
-            await cleanupStaleTask(sessionId: sessionId)
-            
-            if let session = activeUploadSessions[sessionId] {
-                do {
-                    try await processNextChunk(session: session)
-                    AppLog.upload.notice("✅ [TASK VERIFY] 納失タスクの即座復旧が完了: \(sessionId)")
-                } catch {
-                    AppLog.upload.notice("❌ [TASK VERIFY] 納失タスクの復旧に失敗: \(sessionId) - \(error)")
-                }
-            }
-        }
-    }
-    
-    // MARK: - Network Error Handling
-    
-    /// ネットワークエラーで再試行すべきか判定
-    private func shouldRetryForNetworkError(_ error: Error) -> Bool {
-        let nsError = error as NSError
-        
-        // キャンセルエラーは再試行しない（意図的なキャンセル）
-        if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled {
-            AppLog.upload.notice("⚠️ [CANCEL ERROR] キャンセルエラーは再試行しない: \(nsError.localizedDescription)")
-            return false
-        }
-        
-        // ネットワーク関連のエラーコードをチェック（穏やかな再試行のみ）
-        let networkErrorCodes: [Int] = [
-            NSURLErrorNetworkConnectionLost,     // ネットワーク接続が失われた
-            NSURLErrorTimedOut,                   // タイムアウト
-            NSURLErrorNotConnectedToInternet,     // インターネット未接続
-            NSURLErrorCannotConnectToHost,        // ホストに接続できない
-            NSURLErrorDNSLookupFailed,            // DNS解決失敗
-        ]
-        
-        let shouldRetry = nsError.domain == NSURLErrorDomain && networkErrorCodes.contains(nsError.code)
-        
-        if shouldRetry {
-            AppLog.upload.notice("🔄 [NETWORK ERROR] 穏やかな再試行対象エラー: \(nsError.localizedDescription) (Code: \(nsError.code))")
-        } else {
-            AppLog.upload.notice("❌ [NETWORK ERROR] 再試行対象外エラー: \(nsError.localizedDescription) (Code: \(nsError.code))")
-        }
-        
-        return shouldRetry
+        return keys
     }
 }
 
@@ -1425,12 +1214,20 @@ extension NetworkService {
                 return
             }
             let attempt = (session.chunkRetryCounts[chunkIndex] ?? 0) + 1
+            // 試行回数の上限判定は decision の種類より先に置く。retryAfter だけ上限を見ない作りだと、
+            // サーバが 429 と Retry-After を返し続ける限り再送が止まらず、通信量と電池を消費し続ける。
+            let isWithinAttemptLimit = attempt <= RetryPolicy.default.maxAttempts
             let delay: TimeInterval?
             switch decision {
-            case .retryAfter(let hint):
-                delay = min(max(0, hint), RetryPolicy.maxRetryAfterCap)
+            case .retryAfter(let hint) where isWithinAttemptLimit && hint <= RetryPolicy.maxRetryAfterCap:
+                // 指定された秒数をそのまま使う。短くすると Retry-After を尊重したことにならない。
+                delay = max(0, hint)
             case .retry:
                 delay = RetryPolicy.default.delay(forAttempt: attempt)
+            case .retryAfter(let hint):
+                // 自動で待てる範囲を超える指定。早く再送するのではなく自動リトライを止める。
+                AppLog.retry.notice("⏹ [SCHEDULE] session=\(sessionId) chunk=\(chunkIndex) Retry-After=\(hint)s は自動リトライ上限を超過 → 打ち切り")
+                delay = nil
             case .fail:
                 delay = nil
             }
@@ -1469,8 +1266,28 @@ extension NetworkService {
             taskStartTimes[ctx.session.id] = Date()
             uploadQueues[ctx.session.id]?.setProcessing(true)
         }
-        // Phase C.5: 同期永続化はロック外で (disk I/O をロック内から追い出す)
-        UploadManager.shared.saveActiveStateSync()
+        // Phase C.5: 再送予定を耐久化してから開始する。保存できないまま送り出すと、
+        // 強制終了で回数と予定時刻が巻き戻り、上限を超えた再送や Retry-After より
+        // 早い再送が起きる。保存できない場合は作ったタスクを取り消して手を止める。
+        do {
+            try UploadManager.shared.persistActiveState()
+        } catch {
+            AppLog.retry.error("❌ [SCHEDULE] 再送予定の保存に失敗 → タスクを取り消して停止: \(error.localizedDescription)")
+            task.cancel()
+            withState {
+                ctx.session.autoResumeBlocked = true
+                ctx.session.updateStatus(.error)
+                uploadQueues[ctx.session.id]?.setProcessing(false)
+            }
+            let sessionId = ctx.session.id
+            Task {
+                await UploadManager.shared.notifyUploadError(
+                    sessionId: sessionId,
+                    error: NetworkError.fileError("再送予定を保存できませんでした")
+                )
+            }
+            return
+        }
 
         // Phase D: ロック外で resume() — delegate の再入とロック競合を防ぐ
         task.resume()
@@ -1480,10 +1297,10 @@ extension NetworkService {
     /// 同期永続化と error 通知は呼び出し側 (withState 外) で行う。
     private func onMaxRetriesExhaustedLocked(session: UploadSession, chunkIndex: Int) {
         AppLog.retry.error("❌ [MAX RETRIES] session=\(session.id) chunk=\(chunkIndex) 上限到達 → .error 遷移")
-        session.chunkRetryCounts.removeValue(forKey: chunkIndex)
+        // 回数は消さずに残す。消すと次の突き合わせで 1 から数え直しになり、上限が効かなくなる。
         session.chunkNextRetryAt.removeValue(forKey: chunkIndex)
+        session.autoResumeBlocked = true
         session.updateStatus(.error)
-        cleanupTemporaryFile(sessionId: session.id, chunkIndex: chunkIndex)
         // 永続化と通知はロック外で行う (disk I/O をロック内に閉じ込めない)。
         let sessionId = session.id
         Task {
@@ -1530,7 +1347,7 @@ extension NetworkService {
         )
     }
 
-    /// tempURL 作成 + URLRequest + uploadTask + earliestBeginDate。
+    /// ステージング済みチャンクから URLRequest + uploadTask + earliestBeginDate を組み立てる。
     /// **ロックを取得/要求しない**: withState 内・外どちらから呼んでも安全。
     /// 命名は「lock ownership を暗示しない」ように buildUploadTask とする。
     private func buildUploadTask(
@@ -1538,17 +1355,13 @@ extension NetworkService {
         chunkIndex: Int,
         earliestBeginDate: Date?
     ) throws -> URLSessionUploadTask {
-        let chunkData = try FileManager.shared.readChunk(
-            from: session.fileURL,
-            chunkIndex: chunkIndex,
-            chunkSize: session.chunkSize
-        )
-        let checksum = FileManager.shared.calculateChecksum(data: chunkData)
-        let tempURL = try createTemporaryChunkFile(
-            data: chunkData,
-            sessionId: session.id,
-            chunkIndex: chunkIndex
-        )
+        // ステージング済みチャンクをそのまま送る。送信用の一時コピーを別に作ると、
+        // 未送信チャンク全件分が同時に存在してローカル容量を二重に消費する。
+        let chunkURL = FileManager.shared.chunkFileURL(in: session.fileURL, chunkIndex: chunkIndex)
+        guard Foundation.FileManager.default.fileExists(atPath: chunkURL.path) else {
+            throw NetworkError.fileError("ステージング済みチャンクが見つかりません: \(chunkIndex)")
+        }
+        let checksum = FileManager.shared.calculateChecksum(data: try Data(contentsOf: chunkURL))
 
         var request = URLRequest(
             url: APIEndpoint.uploadChunk(sessionId: session.id, chunkIndex: chunkIndex).url
@@ -1557,7 +1370,7 @@ extension NetworkService {
         request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
         request.setValue(checksum, forHTTPHeaderField: "X-Chunk-Checksum")
 
-        let task = backgroundSession.uploadTask(with: request, fromFile: tempURL)
+        let task = backgroundSession.uploadTask(with: request, fromFile: chunkURL)
         if let ebd = earliestBeginDate {
             task.earliestBeginDate = ebd
         }
@@ -1604,41 +1417,152 @@ extension NetworkService {
     /// - missingChunks あり + OS 側にタスク無し: `resumeSessionFromServer(session)` で再投入
     /// - missingChunks あり + OS 側にタスク有り: OS が既に送信中 → 何もしない
     func reconcileWithServer() async {
-        let liveKeys = await reconcileOSOwnedTasks()
-        let liveSessionIds: Set<String> = Set(liveKeys.compactMap {
-            $0.split(separator: ":").first.map(String.init)
-        })
         let sessions = await MainActor.run { Array(UploadManager.shared.activeUploads.values) }
+
+        // OS タスクを調べる前に、復元済みセッションの受け皿を先に作る。
+        // 順序を逆にすると、状態を問い合わせている最中に届いた完了通知が
+        // 「知らないセッション」として捨てられ、進捗も次の投入も止まる。
+        withState {
+            for session in sessions where activeUploadSessions[session.id] == nil {
+                activeUploadSessions[session.id] = session
+                uploadQueues[session.id] = UploadQueue(sessionId: session.id, chunks: [])
+            }
+        }
+
+        let liveKeys = await reconcileOSOwnedTasks()
         AppLog.upload.notice("🔁 [RECONCILE:SERVER] 対象セッション \(sessions.count) 件")
         for session in sessions {
+            // ステージングが途中で終わっているセッションは送るデータが揃っていない。
+            // サーバ側のセッションごと片付けないと、双方に半端な記録が残り続ける。
+            if !FileManager.shared.isStagingComplete(session: session) {
+                AppLog.upload.error("🗑 [RECONCILE] session=\(session.id) はステージング未完了 → 破棄")
+                await cancelOSTasks(sessionId: session.id)
+                _ = try? await performControlRequest(
+                    endpoint: .deleteSession(sessionId: session.id),
+                    method: "DELETE",
+                    responseType: EmptyResponse.self
+                )
+                await MainActor.run {
+                    UploadManager.shared.discardSession(sessionId: session.id, reason: "staging-incomplete")
+                }
+                continue
+            }
+
+            // ユーザーが自分で止めたセッションは自動で動かさない。
+            // 突き合わせの対象にすると、フォアグラウンド復帰のたびに勝手に再開する。
+            guard session.status != .paused && session.status != .cancelled else {
+                AppLog.upload.notice("⏸ [RECONCILE] session=\(session.id) は \(session.status.rawValue) のため対象外")
+                continue
+            }
+
+            // リトライ上限に達した、あるいはサーバがやり直しても変わらないと言っている
+            // セッションも自動では動かさない。ここを通すと復帰のたびに新しい5回が始まり、
+            // 上限が実質的に無くなる。再開は利用者の明示的な操作に限る。
+            guard !session.autoResumeBlocked else {
+                AppLog.upload.notice("⛔ [RECONCILE] session=\(session.id) は自動再開の対象外 (利用者の再試行待ち)")
+                continue
+            }
+
             do {
                 let status = try await getSessionStatus(sessionId: session.id)
+                session.serverExpiresAt = NetworkService.parseServerDate(status.expiresAt)
                 if status.missingChunks.isEmpty {
-                    AppLog.upload.notice("✅ [RECONCILE] session=\(session.id) はサーバ側完了 → completeUpload")
                     NetworkService.syncUploadedChunks(
                         session: session,
                         missingChunks: [],
                         totalChunks: session.totalChunks
                     )
-                    try? await completeUpload(session: session)
-                } else if liveSessionIds.contains(session.id) {
-                    AppLog.upload.notice("🔁 [RECONCILE] session=\(session.id) は OS 側で送信中 → 待機")
+                    if status.status == UploadStatus.completed.rawValue {
+                        AppLog.upload.notice("✅ [RECONCILE] session=\(session.id) はサーバ側で結合済み → 完了として取り込み")
+                        adoptServerCompletion(session: session)
+                    } else if status.status == UploadStatus.error.rawValue && status.finalizeFatal == true {
+                        AppLog.upload.error("❌ [RECONCILE] session=\(session.id) はサーバ側で恒久的に失敗 → error として取り込み")
+                        adoptServerFailure(
+                            session: session,
+                            message: status.finalizeError ?? "サーバ側でアップロードが失敗しました"
+                        )
+                    } else {
+                        AppLog.upload.notice("✅ [RECONCILE] session=\(session.id) は全チャンク到達済み → 結合結果を確認")
+                        try? await completeUpload(session: session)
+                    }
+                    continue
+                }
+
+                // OS 側で生きているタスクをチャンク単位で数え上げる。セッション単位で
+                // 「1 本でも生きていれば待機」としてしまうと、残り 50 チャンクが
+                // どこにも積まれていないのに待ち続け、次のフォアグラウンド復帰まで送信が止まる。
+                let liveChunks = NetworkService.liveChunkIndices(for: session.id, in: liveKeys)
+                let pending = status.missingChunks.filter { !liveChunks.contains($0) }
+
+                if pending.isEmpty {
+                    AppLog.upload.notice("🔁 [RECONCILE] session=\(session.id) 残 \(status.missingChunks.count) チャンクはすべて OS 側で送信中 → 待機")
+                    registerForDelegateCallbacks(session: session, status: status, pendingChunks: [])
                 } else {
-                    AppLog.upload.notice("🔁 [RECONCILE] session=\(session.id) 残 \(status.missingChunks.count) チャンク → resume")
-                    try? await resumeSessionFromServer(session)
+                    AppLog.upload.notice("🔁 [RECONCILE] session=\(session.id) 残 \(status.missingChunks.count) チャンクのうち \(pending.count) 件を投入 (OS 側で送信中: \(liveChunks.count) 件)")
+                    registerForDelegateCallbacks(session: session, status: status, pendingChunks: pending)
+                    try? enqueueAllPendingChunks(session: session)
                 }
             } catch let NetworkError.httpError(code, _) where code == 404 {
-                AppLog.upload.notice("🗑 [RECONCILE] session=\(session.id) はサーバ 404 → discard")
                 // discard 前に OS 側の live task も片付ける。片付けを怠ると、
                 // discard 後に delegate が「不明セッションの chunk 完了」を受けて誤動作する。
                 await cancelOSTasks(sessionId: session.id)
-                await MainActor.run {
-                    UploadManager.shared.discardSession(sessionId: session.id, reason: "server-404")
+
+                // 期限を過ぎたと確認できた 404 だけが「サーバ側で正当に消えた」状態。
+                // それ以外の 404 は一時的な不調かもしれないので、手元のチャンクも
+                // 突き合わせ対象としての登録も残したまま、状態だけを失敗にする。
+                let isExpired = session.serverExpiresAt.map { $0 <= Date() } ?? false
+                if isExpired {
+                    AppLog.upload.notice("🗑 [RECONCILE] session=\(session.id) は期限切れ → 破棄")
+                    await MainActor.run {
+                        UploadManager.shared.discardSession(sessionId: session.id, reason: "server-expired")
+                    }
+                } else {
+                    AppLog.upload.error("⚠️ [RECONCILE] session=\(session.id) は 404 だが期限内 → 手元に残して失敗として記録")
+                    await MainActor.run {
+                        UploadManager.shared.markSessionUnreachable(sessionId: session.id, reason: "server-404")
+                    }
                 }
             } catch {
                 AppLog.upload.error("⚠️ [RECONCILE] session=\(session.id) status 取得失敗 (\(error.localizedDescription)) → 次回起動時に再試行")
             }
         }
+    }
+
+    /// reconcile 用の live キー集合 ("sessionId:chunkIndex") から、指定セッションのチャンク番号を取り出す。
+    /// sessionId 自身に ":" が含まれても壊れないよう、最後の ":" で区切る。
+    static func liveChunkIndices(for sessionId: String, in liveKeys: Set<String>) -> Set<Int> {
+        var indices: Set<Int> = []
+        for key in liveKeys {
+            guard let separator = key.lastIndex(of: ":") else { continue }
+            guard String(key[key.startIndex..<separator]) == sessionId else { continue }
+            if let index = Int(key[key.index(after: separator)...]) {
+                indices.insert(index)
+            }
+        }
+        return indices
+    }
+
+    /// 起動直後の復元でセッションを delegate が見つけられる状態にする。
+    ///
+    /// アプリ再起動時は `activeUploadSessions` と `uploadQueues` が空なので、OS 側で
+    /// 生き残っていたタスクの完了通知が届いても `didCompleteWithError` の guard で捨てられ、
+    /// 進捗更新も次チャンクの投入も起きない。ここで両方を登録しておくことでその取りこぼしを防ぐ。
+    /// 生きているタスクはキャンセルしない。OS が既に送っているものを止める理由が無い。
+    private func registerForDelegateCallbacks(
+        session: UploadSession,
+        status: StatusResponse,
+        pendingChunks: [Int]
+    ) {
+        NetworkService.syncUploadedChunks(
+            session: session,
+            missingChunks: status.missingChunks,
+            totalChunks: session.totalChunks
+        )
+        withState {
+            activeUploadSessions[session.id] = session
+            uploadQueues[session.id] = UploadQueue(sessionId: session.id, chunks: pendingChunks)
+        }
+        session.updateStatus(.uploading)
     }
 
     func reconcileOSOwnedTasks() async -> Set<String> {
@@ -1648,13 +1572,11 @@ extension NetworkService {
             guard let url = task.originalRequest?.url,
                   let key = Self.extractSessionChunkKey(from: url) else { continue }
             live.insert(key)
-            // クライアント側 activeTaskIds を再登録
-            let parts = key.split(separator: ":")
-            if let sid = parts.first.map(String.init) {
-                withState {
-                    activeTaskIds[sid] = task.taskIdentifier
-                    uploadQueues[sid]?.setProcessing(true)
-                }
+            // クライアント側 activeTaskIds を再登録する。queue はこの時点では存在しないので
+            // 触らない。呼び出し側の registerForDelegateCallbacks がサーバ状態を見て作り直す。
+            if let separator = key.lastIndex(of: ":") {
+                let sid = String(key[key.startIndex..<separator])
+                withState { activeTaskIds[sid] = task.taskIdentifier }
             }
         }
         AppLog.retry.notice("🔁 [RECONCILE] OS 所有タスク \(live.count) 件を復元")
@@ -1662,21 +1584,4 @@ extension NetworkService {
     }
 }
 
-// MARK: - URLSessionTask State Extension
 
-extension URLSessionTask.State {
-    var description: String {
-        switch self {
-        case .running:
-            return "実行中"
-        case .suspended:
-            return "一時停止"
-        case .canceling:
-            return "キャンセル中"
-        case .completed:
-            return "完了"
-        @unknown default:
-            return "不明"
-        }
-    }
-}

@@ -19,9 +19,51 @@ class FileManager: ObservableObject {
 
     // MARK: - Checksum Calculation
 
+    /// ファイル全体の SHA-256 を、固定長バッファで読みながら計算する。
+    ///
+    /// `Data(contentsOf:)` で一度に読むと、数GBのファイルではメモリ割り当てに失敗するか、
+    /// メモリ圧迫でOSにアプリを終了させられる。この記事が想定する規模では、
+    /// ファイルサイズに関係なく一定のメモリで済む形にしておく必要がある。
     func calculateFileChecksum(url: URL) throws -> String {
-        let data = try Data(contentsOf: url)
-        return calculateChecksum(data: data)
+        let hasAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if hasAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var hasher = SHA256()
+        while let block = try handle.read(upToCount: checksumBufferSize), !block.isEmpty {
+            hasher.update(data: block)
+        }
+        return hasher.finalize().compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    /// チェックサム計算の読み込み単位。大きくしても速度はほぼ変わらず、メモリだけ増える。
+    private var checksumBufferSize: Int { 4 * 1024 * 1024 }
+
+    /// 送信開始に必要なローカル空き容量を確かめる。
+    ///
+    /// 手元に置くチャンクでファイルサイズ1つ分を使う。OS へ引き渡したタスクの控えが
+    /// どれだけ確保されるかは公開仕様として約束されていないため、保守的に同じだけの
+    /// 余裕を積んで 2 倍を目安にしている。仕様上の根拠がある係数ではないので、
+    /// 対象端末と OS で実使用量を測って調整する前提の暫定値とする。
+    /// 足りないまま投入すると途中の書き込みが失敗して原因の分かりにくい停止になるため、
+    /// 始める前に判断して明示的に失敗させる。
+    func ensureSufficientFreeSpace(forFileSize fileSize: Int64) throws {
+        let documents = getDocumentsDirectory()
+        let values = try documents.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        guard let available = values.volumeAvailableCapacityForImportantUsage else { return }
+
+        let required = fileSize * 2
+        guard available >= required else {
+            throw NetworkError.fileError(
+                "空き容量が足りません。必要: 約\(required / 1024 / 1024)MB, 利用可能: \(available / 1024 / 1024)MB"
+            )
+        }
     }
 
     func calculateChecksum(data: Data) -> String {
@@ -147,31 +189,123 @@ class FileManager: ObservableObject {
     /// - `temporaryDirectory` は iOS がストレージ逼迫時に purge する可能性があるので不適。
     /// - Documents/ は同一 bundleID のアプリで永続、reinstall でも通常保持される。
     ///
-    /// 戻り値: アプリ所有のコピー先 URL。以降 UploadSession はこの URL を保持する。
-    func stageFileForUpload(sourceURL: URL, sessionId: String) throws -> URL {
-        let uploadsDir = getDocumentsDirectory().appendingPathComponent("uploads", isDirectory: true)
-        if !Foundation.FileManager.default.fileExists(atPath: uploadsDir.path) {
-            try Foundation.FileManager.default.createDirectory(
-                at: uploadsDir,
-                withIntermediateDirectories: true,
-                attributes: nil
+    /// なぜ全体コピーではなくチャンク単位で書くのか:
+    /// - 「ファイル全体のコピー1つ + 送信用の一時チャンク群」を同時に持つと、アプリが
+    ///   自分で置くぶんだけでファイルサイズの約2倍になる。数GBを扱う前提では
+    ///   容量不足でタスクの投入が途中で止まる。
+    /// - 最初からチャンクとして書き出せばアプリ側の消費はファイルサイズ1つ分で済み、
+    ///   そのまま `uploadTask(with:fromFile:)` の入力として使えるので追加のコピーが要らない。
+    /// - ただし OS へ引き渡したタスクの控えぶんは別途必要になり得るため、端末の空き容量は
+    ///   保守的に 2 倍を目安に見込む。判断は ensureSufficientFreeSpace で送信開始前に行う。
+    ///
+    /// 戻り値: セッション専用のステージングディレクトリ。以降 UploadSession はこの URL を保持する。
+    func stageChunksForUpload(
+        sourceURL: URL,
+        sessionId: String,
+        chunkSize: Int,
+        totalChunks: Int
+    ) throws -> URL {
+        let stagingDir = try stagingDirectory(for: sessionId)
+
+        // 既に存在する場合 (再送 or Force Quit 後の再作成) は作り直す
+        if Foundation.FileManager.default.fileExists(atPath: stagingDir.path) {
+            try? Foundation.FileManager.default.removeItem(at: stagingDir)
+        }
+        try Foundation.FileManager.default.createDirectory(
+            at: stagingDir,
+            withIntermediateDirectories: true,
+            attributes: nil
+        )
+
+        let hasAccess = sourceURL.startAccessingSecurityScopedResource()
+        defer {
+            if hasAccess {
+                sourceURL.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        let handle = try FileHandle(forReadingFrom: sourceURL)
+        defer { try? handle.close() }
+
+        for index in 0..<totalChunks {
+            let data = try handle.read(upToCount: chunkSize) ?? Data()
+            guard !data.isEmpty else {
+                // 途中まで書いたチャンクを残すと、実体と総チャンク数が食い違う状態になる
+                try? Foundation.FileManager.default.removeItem(at: stagingDir)
+                throw NetworkError.fileError("チャンク \(index) を読み込めませんでした: \(sourceURL.lastPathComponent)")
+            }
+
+            let destination = chunkFileURL(in: stagingDir, chunkIndex: index)
+            // .atomic は一時ファイルへ書いてから rename する。書き込み途中で終了しても、
+            // 中身が欠けたチャンクが「揃っている」ように見えることがない。
+            try data.write(to: destination, options: .atomic)
+            try Foundation.FileManager.default.setAttributes(
+                [.protectionKey: FileProtectionType.none],
+                ofItemAtPath: destination.path
             )
         }
-        let ext = sourceURL.pathExtension
-        let destName = ext.isEmpty ? sessionId : "\(sessionId).\(ext)"
-        let destURL = uploadsDir.appendingPathComponent(destName)
 
-        // 既に存在する場合 (再送 or Force Quit 後の再作成) は上書き前提で削除
-        if Foundation.FileManager.default.fileExists(atPath: destURL.path) {
-            try? Foundation.FileManager.default.removeItem(at: destURL)
+        AppLog.upload.notice("📥 [STAGE] session=\(sessionId) を \(totalChunks) チャンクに分割して保存")
+        return stagingDir
+    }
+
+    /// セッション専用のステージングディレクトリ。
+    /// sessionId はサーバ由来の文字列なので、パス要素として使う前に形式を検証する。
+    func stagingDirectory(for sessionId: String) throws -> URL {
+        guard !sessionId.isEmpty,
+              sessionId.count <= 128,
+              sessionId.allSatisfy({ $0.isLetter || $0.isNumber || $0 == "_" || $0 == "-" }) else {
+            throw NetworkError.fileError("不正なセッションID形式: \(sessionId)")
         }
-        try Foundation.FileManager.default.copyItem(at: sourceURL, to: destURL)
-        try Foundation.FileManager.default.setAttributes(
-            [.protectionKey: FileProtectionType.none],
-            ofItemAtPath: destURL.path
-        )
-        AppLog.upload.notice("📥 [STAGE] コピー完了: \(sourceURL.lastPathComponent) → \(destURL.path)")
-        return destURL
+        return getDocumentsDirectory()
+            .appendingPathComponent("uploads", isDirectory: true)
+            .appendingPathComponent(sessionId, isDirectory: true)
+    }
+
+    /// ステージング済みチャンクのファイル URL。
+    func chunkFileURL(in stagingDirectory: URL, chunkIndex: Int) -> URL {
+        stagingDirectory.appendingPathComponent("chunk_\(chunkIndex).dat")
+    }
+
+    /// セッションの全チャンクがステージング済みかどうか。
+    ///
+    /// 存在だけでなくサイズも確かめる。作成直後に強制終了されると、記録はあるが
+    /// チャンクが揃っていない状態や、中身が途中までのファイルが残ることがある。
+    /// これを完全とみなして送ると、各チャンクの検証は通るのに最後の全体検証だけが
+    /// 失敗する、原因の見えにくい不具合になる。
+    func isStagingComplete(session: UploadSession) -> Bool {
+        for index in 0..<session.totalChunks {
+            let url = chunkFileURL(in: session.fileURL, chunkIndex: index)
+            guard let attributes = try? Foundation.FileManager.default.attributesOfItem(atPath: url.path),
+                  let size = attributes[.size] as? Int64 else {
+                return false
+            }
+
+            let offset = Int64(index) * Int64(session.chunkSize)
+            let expected = min(Int64(session.chunkSize), session.fileSize - offset)
+            if size != expected {
+                AppLog.upload.error("⚠️ [STAGE] session=\(session.id) chunk=\(index) のサイズが不一致 (期待: \(expected), 実際: \(size))")
+                return false
+            }
+        }
+        return true
+    }
+
+    /// 送信中のどのセッションにも属さないステージングディレクトリを削除する。
+    /// 強制終了や破棄で取り残されたチャンク群がローカル容量を占め続けるのを防ぐ。
+    func cleanupOrphanedStagingDirectories(activeSessionIds: Set<String>) {
+        let uploadsDir = getDocumentsDirectory().appendingPathComponent("uploads", isDirectory: true)
+        let entries = (try? Foundation.FileManager.default.contentsOfDirectory(atPath: uploadsDir.path)) ?? []
+
+        var removed = 0
+        for name in entries where !activeSessionIds.contains(name) {
+            try? Foundation.FileManager.default.removeItem(at: uploadsDir.appendingPathComponent(name))
+            removed += 1
+        }
+
+        if removed > 0 {
+            AppLog.upload.notice("🧹 [STAGE GC] 参照されていないステージング \(removed) 件を削除")
+        }
     }
 
     /// stageFileForUpload で作ったコピーを削除する。complete / discard / delete 経路で呼ぶ。
