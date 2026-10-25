@@ -255,30 +255,54 @@ func (s *Store) AcquireChunkLock(sessionID string, chunkIndex int, timeout time.
 }
 
 func (s *Store) acquireLock(lockRel string, timeout time.Duration) (*ChunkLock, error) {
-	// ロックファイルの作成または開く
-	lockFile, err := s.root.OpenFile(lockRel, os.O_CREATE|os.O_RDWR, filePerm)
-	if err != nil {
-		return nil, fmt.Errorf("ロックファイル作成エラー: %w", err)
-	}
-
-	// ブロッキングの flock を goroutine で待つと、タイムアウト後に fd を閉じる Close が
-	// その flock から戻るまで止まる (macOS で再現)。LOCK_NB で一定間隔に試して期限で打ち切る。
 	deadline := time.Now().Add(timeout)
+	for {
+		// ロックファイルの作成または開く
+		lockFile, err := s.root.OpenFile(lockRel, os.O_CREATE|os.O_RDWR, filePerm)
+		if err != nil {
+			return nil, fmt.Errorf("ロックファイル作成エラー: %w", err)
+		}
+		linked, err := s.waitForLock(lockFile, lockRel, deadline)
+		if err != nil {
+			_ = lockFile.Close()
+			return nil, err
+		}
+		if linked {
+			return &ChunkLock{LockFile: lockFile, FilePath: lockRel, root: s.root}, nil
+		}
+		// 前の持ち主が消したファイルのロックだった。閉じてロックを外し、今あるファイルで取り直す
+		_ = lockFile.Close()
+	}
+}
+
+// waitForLock lockFile の排他ロックを期限まで待つ。取れたロックが、今 lockRel にある
+// ファイルのものかを返す。
+// ブロッキングの flock を goroutine で待つと、タイムアウト後に fd を閉じる Close が
+// その flock から戻るまで止まる (macOS で再現)。LOCK_NB で一定間隔に試して期限で打ち切る。
+func (s *Store) waitForLock(lockFile *os.File, lockRel string, deadline time.Time) (bool, error) {
 	for {
 		err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
-			return &ChunkLock{LockFile: lockFile, FilePath: lockRel, root: s.root}, nil
+			return s.isLinked(lockFile, lockRel), nil
 		}
 		if !errors.Is(err, syscall.EWOULDBLOCK) {
-			_ = lockFile.Close()
-			return nil, fmt.Errorf("ロック取得エラー: %w", err)
+			return false, fmt.Errorf("ロック取得エラー: %w", err)
 		}
 		if !time.Now().Before(deadline) {
-			_ = lockFile.Close()
-			return nil, errors.New("ロック取得タイムアウト")
+			return false, errors.New("ロック取得タイムアウト")
 		}
 		time.Sleep(lockPollInterval)
 	}
+}
+
+// isLinked 開いているファイルが、今 rel にあるファイルと同じものかを返す。
+func (s *Store) isLinked(f *os.File, rel string) bool {
+	held, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	current, err := s.root.Stat(rel)
+	return err == nil && os.SameFile(held, current)
 }
 
 // Release ロックを解放
@@ -286,6 +310,10 @@ func (cl *ChunkLock) Release() error {
 	if cl.LockFile == nil {
 		return nil
 	}
+
+	// ロックを持ったまま先に消す。消した後に来た要求は新しいファイルを作り、
+	// 消えたファイルのロックを待っていた要求は isLinked で取り直すので、持ち主は常に1つになる。
+	removeErr := cl.root.Remove(cl.FilePath)
 
 	// ロック解放
 	err := syscall.Flock(int(cl.LockFile.Fd()), syscall.LOCK_UN)
@@ -296,9 +324,6 @@ func (cl *ChunkLock) Release() error {
 
 	// ファイルクローズ
 	closeErr := cl.LockFile.Close()
-
-	// ロックファイル削除
-	removeErr := cl.root.Remove(cl.FilePath)
 
 	if closeErr != nil {
 		return fmt.Errorf("ロックファイルクローズエラー: %w", closeErr)

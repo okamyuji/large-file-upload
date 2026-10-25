@@ -381,3 +381,95 @@ func TestAtomicWriteFileFailsWithoutParentDirectory(t *testing.T) {
 		t.Fatal("親ディレクトリが無いのに成功した")
 	}
 }
+
+// 解放と同時に待っていた要求と新しく来た要求が、別々のロックファイルを掴んで
+// 同時にロックを持つことがないこと。旧実装は解放してからロックファイルを消していたので、
+// 待っていた側は消えたファイルのロックを、新しい側は作り直したファイルのロックを取れた。
+func TestChunkLockHasOneHolderWhenReleasedWhileOthersWait(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.CreateWorkingDirectory("s1"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.AcquireChunkLock("s1", 0, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		lock *ChunkLock
+		err  error
+	}
+	acquired := make(chan result, 2)
+	acquire := func() {
+		lock, err := store.AcquireChunkLock("s1", 0, 300*time.Millisecond)
+		acquired <- result{lock, err}
+	}
+	go acquire()
+	time.Sleep(20 * time.Millisecond) // 待つ側が古いロックファイルを開いて待っている状態にする
+
+	if err := first.Release(); err != nil {
+		t.Fatal(err)
+	}
+	go acquire()
+
+	var holders []*ChunkLock
+	for range 2 {
+		r := <-acquired
+		if r.err == nil {
+			holders = append(holders, r.lock)
+		}
+	}
+	for _, h := range holders {
+		_ = h.Release()
+	}
+	if len(holders) != 1 {
+		t.Fatalf("同時にロックを持った要求の数 = %d、1 であるべき", len(holders))
+	}
+}
+
+// 解放は、ロックを外す前にロックファイルを消すこと。消す前に外すと、その隙間に
+// ロックを取った待ち手には、まだ同じ場所にあるファイルに見えて持ち主が2つになる。
+// 隙間は数マイクロ秒なので、待ち手が休まずに試し続ける形で何度も繰り返して捉える。
+func TestChunkLockReleaseUnlinksBeforeUnlocking(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.CreateWorkingDirectory("s1"); err != nil {
+		t.Fatal(err)
+	}
+	lockRel := filepath.Join("s1", "chunk_0.lock")
+
+	for i := range 200 {
+		holder, err := store.AcquireChunkLock("s1", 0, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		waiter, err := store.root.OpenFile(lockRel, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spinning := make(chan struct{})
+		linkedAtLock := make(chan bool, 1)
+		go func() {
+			signaled := false
+			for {
+				if syscall.Flock(int(waiter.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+					linkedAtLock <- store.isLinked(waiter, lockRel)
+					return
+				}
+				if !signaled {
+					close(spinning)
+					signaled = true
+				}
+			}
+		}()
+		<-spinning
+
+		if err := holder.Release(); err != nil {
+			t.Fatal(err)
+		}
+		linked := <-linkedAtLock
+		_ = waiter.Close()
+		if linked {
+			t.Fatalf("試行 %d: ロックを外した時点でロックファイルがまだ残っていた", i)
+		}
+	}
+}
