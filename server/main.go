@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -24,13 +25,11 @@ const (
 )
 
 func main() {
-	// uploadsディレクトリを確保
-	if err := utils.EnsureUploadsDirectory(); err != nil {
-		log.Fatalf("uploadsディレクトリ作成エラー: %v", err)
+	// サービス初期化 (uploadsディレクトリの作成を含む)
+	uploadService, err := services.NewUploadService()
+	if err != nil {
+		log.Fatalf("アップロードサービス初期化エラー: %v", err)
 	}
-
-	// サービス初期化
-	uploadService := services.NewUploadService()
 	log.Printf("保持期間: 未完了セッション %s / 完了済みセッション %s",
 		services.DefaultIncompleteSessionMaxAge, services.DefaultCompletedSessionMaxAge)
 
@@ -115,9 +114,11 @@ func main() {
 	}()
 
 	// サーバー開始
-	log.Printf("サーバーを開始します（ポート: %s）", port)
-	log.Printf("API仕様書: http://localhost:%s/", port)
-	log.Printf("ヘルスチェック: http://localhost:%s/health", port)
+	// PORT は環境変数由来。strconv.Quote で制御文字をエスケープし、ログ行の偽造を防ぐ(gosec G706 が認識する無害化関数でもある)
+	safePort := strconv.Quote(port)
+	log.Printf("サーバーを開始します（ポート: %s）", safePort)
+	log.Printf("API仕様書: http://localhost:%s/", safePort)
+	log.Printf("ヘルスチェック: http://localhost:%s/health", safePort)
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("サーバー開始エラー: %v", err)

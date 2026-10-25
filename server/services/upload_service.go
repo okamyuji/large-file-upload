@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -28,6 +27,9 @@ const DefaultCompletedSessionMaxAge = 30 * 24 * time.Hour
 
 // UploadService アップロードサービス
 type UploadService struct {
+	// store uploads 配下のファイル操作の窓口。Root 経由で uploads の外に出られない。
+	store *utils.Store
+
 	sessions    map[string]*models.UploadSession
 	sessionsMux sync.RWMutex
 
@@ -50,7 +52,7 @@ type UploadService struct {
 }
 
 // NewUploadService 新しいアップロードサービスを作成
-func NewUploadService() *UploadService {
+func NewUploadService() (*UploadService, error) {
 	return NewUploadServiceWithRetention(
 		DefaultIncompleteSessionMaxAge,
 		DefaultCompletedSessionMaxAge,
@@ -58,8 +60,14 @@ func NewUploadService() *UploadService {
 }
 
 // NewUploadServiceWithRetention 保持期間を明示してアップロードサービスを作成する。
-func NewUploadServiceWithRetention(incompleteMaxAge, completedMaxAge time.Duration) *UploadService {
+func NewUploadServiceWithRetention(incompleteMaxAge, completedMaxAge time.Duration) (*UploadService, error) {
+	store, err := utils.OpenStore()
+	if err != nil {
+		return nil, err
+	}
+
 	service := &UploadService{
+		store:            store,
 		sessions:         make(map[string]*models.UploadSession),
 		finalizing:       make(map[string]chan struct{}),
 		manifestMux:      make(map[string]*sync.Mutex),
@@ -67,14 +75,14 @@ func NewUploadServiceWithRetention(incompleteMaxAge, completedMaxAge time.Durati
 		completedMaxAge:  completedMaxAge,
 	}
 	service.restorePersistedSessions()
-	return service
+	return service, nil
 }
 
 // restorePersistedSessions 起動時にディスク上のマニフェストからセッションを復元する。
 // サーバをSoTとして扱うには、プロセス再起動を越えて状態が残らなければ意味がない。
 // 復元しないと再起動後の GET /status が404になり、クライアントは再開先を失う。
 func (s *UploadService) restorePersistedSessions() {
-	sessions, err := utils.LoadPersistedSessions()
+	sessions, err := s.store.LoadPersistedSessions()
 	if err != nil {
 		log.Printf("⚠️ [RESTORE] セッション復元エラー: %v", err)
 		return
@@ -86,7 +94,7 @@ func (s *UploadService) restorePersistedSessions() {
 			// 完了と記録されていても実体を確かめる。結合済みのチャンクは削除されているため、
 			// ここで嘘を通すとクライアントは完了を信じて手元のコピーまで消してしまう。
 			// 全体の再ハッシュは数GBだと起動を止めてしまうので、存在とサイズの一致までを見る。
-			if err := verifyFinalFile(session); err != nil {
+			if err := s.verifyFinalFile(session); err != nil {
 				log.Printf("❌ [RESTORE] session=%s の最終ファイル検証に失敗: %v", session.ID, err)
 				session.Status = models.StatusError
 				session.FinalizeError = err.Error()
@@ -97,7 +105,7 @@ func (s *UploadService) restorePersistedSessions() {
 			// マニフェストに載っていても実体が消えているチャンクは未受信として扱う。
 			// ここを怠ると GET /status が嘘の missingChunks を返し、結合が必ず失敗する。
 			for index, info := range session.UploadedChunks {
-				if _, statErr := os.Stat(info.FilePath); statErr != nil {
+				if _, statErr := s.store.Stat(info.FilePath); statErr != nil {
 					log.Printf("⚠️ [RESTORE] session=%s chunk=%d の実体が無いため未受信に戻します", session.ID, index)
 					delete(session.UploadedChunks, index)
 				}
@@ -110,7 +118,7 @@ func (s *UploadService) restorePersistedSessions() {
 		}
 
 		// 前回の結合や書き込みの途中で落ちた痕跡を、結合を再開する前に片付ける
-		utils.CleanupStaleTempFiles(session.WorkingDir)
+		s.store.CleanupStaleTempFiles(session.WorkingDir)
 
 		s.sessions[session.ID] = session
 		if session.Status != models.StatusCompleted && session.IsComplete() && !session.FinalizeFatal {
@@ -130,12 +138,12 @@ func (s *UploadService) restorePersistedSessions() {
 }
 
 // verifyFinalFile 完了と記録されたセッションの最終ファイルが実在し、想定サイズと一致するか確かめる。
-func verifyFinalFile(session *models.UploadSession) error {
+func (s *UploadService) verifyFinalFile(session *models.UploadSession) error {
 	if session.FinalFilePath == "" {
 		return errors.New("完了と記録されていますが最終ファイルのパスがありません")
 	}
 
-	info, err := os.Stat(session.FinalFilePath)
+	info, err := s.store.Stat(session.FinalFilePath)
 	if err != nil {
 		return fmt.Errorf("最終ファイルが見つかりません: %w", err)
 	}
@@ -180,7 +188,7 @@ func (s *UploadService) persistSnapshot(snapshot *models.UploadSession) error {
 
 // writeManifest 呼び出し側で manifestLock を保持した状態で呼ぶ。
 func (s *UploadService) writeManifest(snapshot *models.UploadSession) error {
-	if err := utils.SaveSessionManifest(snapshot); err != nil {
+	if err := s.store.SaveSessionManifest(snapshot); err != nil {
 		log.Printf("⚠️ [PERSIST] session=%s マニフェスト保存エラー: %v", snapshot.ID, err)
 		return err
 	}
@@ -218,7 +226,7 @@ func (s *UploadService) CreateSession(req *models.CreateSessionRequest) (*models
 	sessionID := utils.GenerateSessionID()
 
 	// 作業ディレクトリ作成
-	workingDir, err := utils.CreateWorkingDirectory(sessionID)
+	workingDir, err := s.store.CreateWorkingDirectory(sessionID)
 	if err != nil {
 		return nil, fmt.Errorf("作業ディレクトリ作成エラー: %w", err)
 	}
@@ -249,7 +257,7 @@ func (s *UploadService) CreateSession(req *models.CreateSessionRequest) (*models
 		s.sessionsMux.Lock()
 		delete(s.sessions, sessionID)
 		s.sessionsMux.Unlock()
-		_ = utils.CleanupWorkingDirectory(workingDir)
+		_ = s.store.CleanupWorkingDirectory(workingDir)
 		return nil, fmt.Errorf("セッション情報の保存に失敗しました: %w", err)
 	}
 
@@ -285,7 +293,7 @@ func (s *UploadService) UploadChunk(sessionID string, chunkIndex int, chunkData 
 	}
 
 	// チャンクレベルのファイルロック取得（10秒タイムアウト）
-	chunkLock, err := utils.AcquireChunkLock(sessionID, chunkIndex, 10*time.Second)
+	chunkLock, err := s.store.AcquireChunkLock(sessionID, chunkIndex, 10*time.Second)
 	if err != nil {
 		return fmt.Errorf("チャンクロック取得エラー: %w", err)
 	}
@@ -339,7 +347,7 @@ func (s *UploadService) UploadChunk(sessionID string, chunkIndex int, chunkData 
 	chunkFileName := fmt.Sprintf("chunk_%d.dat", chunkIndex)
 	chunkFilePath := filepath.Join(session.WorkingDir, chunkFileName)
 
-	if err := utils.AtomicChunkWrite(chunkFilePath, chunkData); err != nil {
+	if err := s.store.AtomicChunkWrite(chunkFilePath, chunkData); err != nil {
 		return fmt.Errorf("チャンクファイル保存エラー: %w", err)
 	}
 
@@ -442,10 +450,10 @@ func (s *UploadService) runFinalize(sessionID string, done chan struct{}) {
 	log.Printf("🔗 [FINALIZE] session=%s 結合開始 (%d チャンク)", sessionID, snapshot.TotalChunks)
 
 	fatal := false
-	finalFilePath, err := utils.CombineChunks(snapshot)
+	finalFilePath, err := s.store.CombineChunks(snapshot)
 	if err == nil {
 		var finalChecksum string
-		finalChecksum, err = utils.CalculateFileChecksum(finalFilePath)
+		finalChecksum, err = s.store.CalculateFileChecksum(finalFilePath)
 		if err == nil && finalChecksum != snapshot.FileChecksum {
 			// 同じチャンクから同じ結果しか出ないので、やり直しても変わらない
 			err = fmt.Errorf("ファイル整合性チェック失敗 - 期待値: %s, 実際の値: %s", snapshot.FileChecksum, finalChecksum)
@@ -635,7 +643,7 @@ func (s *UploadService) DeleteSession(sessionID string) error {
 	defer s.sessionsMux.Unlock()
 
 	// 作業ディレクトリを削除
-	if err := utils.CleanupWorkingDirectory(session.WorkingDir); err != nil {
+	if err := s.store.CleanupWorkingDirectory(session.WorkingDir); err != nil {
 		return fmt.Errorf("作業ディレクトリクリーンアップエラー: %w", err)
 	}
 
@@ -675,7 +683,7 @@ func (s *UploadService) validateCreateSessionRequest(req *models.CreateSessionRe
 // cleanupChunkFiles チャンクファイルを削除（最終ファイルは残す）
 func (s *UploadService) cleanupChunkFiles(session *models.UploadSession) {
 	for _, chunkInfo := range session.UploadedChunks {
-		_ = os.Remove(chunkInfo.FilePath)
+		_ = s.store.Remove(chunkInfo.FilePath)
 	}
 }
 
@@ -715,7 +723,7 @@ func (s *UploadService) CleanupExpiredSessions() int {
 		if now.Sub(session.UpdatedAt) > maxAge {
 			log.Printf("🗑 [CLEANUP] session=%s status=%s を期限切れとして削除 (経過: %s, 期限: %s)",
 				sessionID, string(session.Status), now.Sub(session.UpdatedAt).Round(time.Minute), maxAge)
-			_ = utils.CleanupWorkingDirectory(session.WorkingDir)
+			_ = s.store.CleanupWorkingDirectory(session.WorkingDir)
 			delete(s.sessions, sessionID)
 			expired = append(expired, sessionID)
 		}

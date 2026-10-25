@@ -24,9 +24,18 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func newTestService(t *testing.T) *services.UploadService {
+	t.Helper()
+	service, err := services.NewUploadService()
+	if err != nil {
+		t.Fatalf("サービス作成に失敗: %v", err)
+	}
+	return service
+}
+
 func TestUploadWorkflow(t *testing.T) {
 	// テスト用のサービスとハンドラーを作成
-	uploadService := services.NewUploadService()
+	uploadService := newTestService(t)
 	handler := handlers.NewUploadHandler(uploadService)
 
 	// テストデータ準備 (チャンクサイズ 1024 の 3 倍以上でチャンク分割を検証できるように調整)
@@ -221,7 +230,7 @@ func TestUploadWorkflow(t *testing.T) {
 }
 
 func TestErrorCases(t *testing.T) {
-	uploadService := services.NewUploadService()
+	uploadService := newTestService(t)
 	handler := handlers.NewUploadHandler(uploadService)
 
 	// 無効なセッション作成リクエストテスト
@@ -305,7 +314,7 @@ func TestErrorCases(t *testing.T) {
 }
 
 func TestHealthEndpoint(t *testing.T) {
-	uploadService := services.NewUploadService()
+	uploadService := newTestService(t)
 	handler := handlers.NewUploadHandler(uploadService)
 
 	// ヘルスチェックエンドポイントのテスト用ハンドラー
