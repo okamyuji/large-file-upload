@@ -226,7 +226,7 @@ func TestStoreLifecycle(t *testing.T) {
 	if err := store.AtomicWriteFile(stale, []byte("t")); err != nil {
 		t.Fatal(err)
 	}
-	store.CleanupStaleTempFiles(workingDir)
+	store.CleanupStaleTempFiles(workingDir, "keep.dat")
 	if _, err := store.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("一時ファイルが残っている: %v", err)
 	}
@@ -239,11 +239,26 @@ func TestStoreLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	store.CleanupStaleTempFiles(workingDir)
+	store.CleanupStaleTempFiles(workingDir, "keep.dat")
 	for _, name := range []string{"backup.tmp.zip", "x.combining.tar", "a.dat.tmp.deadbee", "a.dat.tmp.DEADBEEF"} {
 		if _, err := store.Stat(filepath.Join(workingDir, name)); err != nil {
 			t.Fatalf("一時ファイルでない %s が消えた: %v", name, err)
 		}
+	}
+	// 完成ファイルの名前が一時ファイルの接尾辞と同じ形でも、そのセッションの完成ファイルは残す
+	final := filepath.Join(workingDir, "backup.tmp.deadbeef")
+	staleNext := filepath.Join(workingDir, "chunk_2.dat.tmp.cafebabe")
+	for _, f := range []string{final, staleNext} {
+		if err := store.AtomicWriteFile(f, []byte("f")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.CleanupStaleTempFiles(workingDir, "backup.tmp.deadbeef")
+	if _, err := store.Stat(final); err != nil {
+		t.Fatalf("完成ファイルが消えた: %v", err)
+	}
+	if _, err := store.Stat(staleNext); !os.IsNotExist(err) {
+		t.Fatalf("一時ファイルが残っている: %v", err)
 	}
 
 	// マニフェストの往復。ID がディレクトリ名と食い違うものは読み込まない

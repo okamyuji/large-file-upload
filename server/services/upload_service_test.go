@@ -432,3 +432,31 @@ func TestRestoreDropsChunksWithoutFiles(t *testing.T) {
 		t.Fatalf("実体の無いチャンクが受信済みのまま残っています: %d", status.UploadedChunks)
 	}
 }
+
+// 完成ファイルの名前が一時ファイルの接尾辞と同じ形でも、再起動時の掃除で消さないこと。
+func TestRestoreKeepsFinalFileNamedLikeTempFile(t *testing.T) {
+	useTempUploadsDir(t)
+
+	service := newTestService(t)
+	data := []byte(strings.Repeat("一時ファイルと同じ形の名前の完成ファイルを残すことを確認するデータ\n", 100))
+	chunkSize := 1024
+	session, err := service.CreateSession(&models.CreateSessionRequest{
+		FileName:     "backup.tmp.deadbeef",
+		TotalChunks:  (len(data) + chunkSize - 1) / chunkSize,
+		FileSize:     int64(len(data)),
+		FileChecksum: utils.CalculateChecksum(data),
+		ChunkSize:    chunkSize,
+	})
+	if err != nil {
+		t.Fatalf("セッション作成に失敗: %v", err)
+	}
+	uploadAllChunks(t, service, session.ID, data, chunkSize)
+	waitForStatus(t, service, session.ID, models.StatusCompleted)
+
+	stored, _ := service.GetSession(session.ID)
+	newTestService(t) // 再起動。復元のときに書きかけの一時ファイルを掃除する
+
+	if _, err := os.Stat(stored.FinalFilePath); err != nil {
+		t.Fatalf("再起動時の掃除で完成ファイルが消えた: %v", err)
+	}
+}

@@ -118,7 +118,7 @@ func (s *UploadService) restorePersistedSessions() {
 		}
 
 		// 前回の結合や書き込みの途中で落ちた痕跡を、結合を再開する前に片付ける
-		s.store.CleanupStaleTempFiles(session.WorkingDir)
+		s.store.CleanupStaleTempFiles(session.WorkingDir, session.FileName)
 
 		s.sessions[session.ID] = session
 		if session.Status != models.StatusCompleted && session.IsComplete() && !session.FinalizeFatal {

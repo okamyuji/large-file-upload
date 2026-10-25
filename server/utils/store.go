@@ -388,7 +388,8 @@ func (s *Store) readDir(rel string) ([]fs.DirEntry, error) {
 // ".tmp." を含むだけの名前（backup.tmp.zip など）は利用者の完成ファイルなので消さない。
 var staleTempPattern = regexp.MustCompile(`\.(combining|tmp)\.[0-9a-f]{8}$`)
 
-func (s *Store) CleanupStaleTempFiles(workingDir string) {
+// finalName はそのセッションの完成ファイル名。利用者の付けた名前が接尾辞と同じ形でも消さない。
+func (s *Store) CleanupStaleTempFiles(workingDir, finalName string) {
 	dirRel, err := s.rel(workingDir)
 	if err != nil {
 		return
@@ -400,7 +401,7 @@ func (s *Store) CleanupStaleTempFiles(workingDir string) {
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if !staleTempPattern.MatchString(name) {
+		if name == finalName || !staleTempPattern.MatchString(name) {
 			continue
 		}
 		if removeErr := s.root.Remove(filepath.Join(dirRel, name)); removeErr == nil {
