@@ -226,7 +226,7 @@ func (h *UploadHandler) completeUpload(w http.ResponseWriter, r *http.Request) {
 	// アップロード完了処理
 	result, err := h.uploadService.CompleteUpload(sessionID)
 	if err != nil {
-		log.Printf("❌ [COMPLETE] Error: %v", err)
+		log.Printf("❌ [COMPLETE] Error: %s", strconv.Quote(err.Error()))
 		if strings.Contains(err.Error(), "セッションが見つかりません") {
 			utils.WriteErrorResponse(w, http.StatusNotFound, "SESSION_NOT_FOUND", "セッションが見つかりません", err.Error())
 		} else if strings.Contains(err.Error(), "未完了") {
