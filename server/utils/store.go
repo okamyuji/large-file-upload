@@ -257,10 +257,9 @@ func (s *Store) AcquireChunkLock(sessionID string, chunkIndex int, timeout time.
 func (s *Store) acquireLock(lockRel string, timeout time.Duration) (*ChunkLock, error) {
 	deadline := time.Now().Add(timeout)
 	for {
-		// ロックファイルの作成または開く
-		lockFile, err := s.root.OpenFile(lockRel, os.O_CREATE|os.O_RDWR, filePerm)
+		lockFile, err := s.openLockFile(lockRel, deadline)
 		if err != nil {
-			return nil, fmt.Errorf("ロックファイル作成エラー: %w", err)
+			return nil, err
 		}
 		linked, err := s.waitForLock(lockFile, lockRel, deadline)
 		if err != nil {
@@ -273,6 +272,27 @@ func (s *Store) acquireLock(lockRel string, timeout time.Duration) (*ChunkLock, 
 		// 前の持ち主が消したファイルのロックだった。閉じてロックを外し、今あるファイルで取り直す
 		_ = lockFile.Close()
 	}
+}
+
+// openLockFile ロックファイルを作成または開く。
+// 解放がロックファイルを消すのと重なると、O_CREATE を付けても ENOENT が返ることがある
+// (darwin で再現)。作業ディレクトリが残っている間は一時的な失敗として期限まで開き直す。
+func (s *Store) openLockFile(lockRel string, deadline time.Time) (*os.File, error) {
+	for {
+		lockFile, err := s.root.OpenFile(lockRel, os.O_CREATE|os.O_RDWR, filePerm)
+		if err == nil {
+			return lockFile, nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) || !time.Now().Before(deadline) || !s.dirExists(filepath.Dir(lockRel)) {
+			return nil, fmt.Errorf("ロックファイル作成エラー: %w", err)
+		}
+		time.Sleep(lockPollInterval)
+	}
+}
+
+func (s *Store) dirExists(rel string) bool {
+	info, err := s.root.Stat(rel)
+	return err == nil && info.IsDir()
 }
 
 // waitForLock lockFile の排他ロックを期限まで待つ。取れたロックが、今 lockRel にある

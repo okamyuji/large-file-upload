@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -471,5 +472,76 @@ func TestChunkLockReleaseUnlinksBeforeUnlocking(t *testing.T) {
 		if linked {
 			t.Fatalf("試行 %d: ロックを外した時点でロックファイルがまだ残っていた", i)
 		}
+	}
+}
+
+// 同じロックへの取得と解放が多数重なっても、期限内なら取得は失敗しないこと。
+// 解放がロックファイルを消した直後に開くと、作り直す前で ENOENT になることがある。
+func TestChunkLockSurvivesHeavyContention(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.CreateWorkingDirectory("s1"); err != nil {
+		t.Fatal(err)
+	}
+	const workers, rounds = 16, 30
+	errs := make(chan error, workers*rounds)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for range rounds {
+				lock, err := store.AcquireChunkLock("s1", 0, 10*time.Second)
+				if err != nil {
+					errs <- err
+					continue
+				}
+				if err := lock.Release(); err != nil {
+					errs <- err
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	var failures []string
+	for err := range errs {
+		failures = append(failures, err.Error())
+	}
+	if len(failures) > 0 {
+		t.Fatalf("%d 件失敗した。最初: %s", len(failures), failures[0])
+	}
+}
+
+// 作業ディレクトリが無いときは、ロックの期限まで待たずにすぐ失敗すること。
+func TestAcquireChunkLockFailsFastWithoutWorkingDirectory(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	start := time.Now()
+	_, err := store.AcquireChunkLock("missing", 0, 5*time.Second)
+
+	if err == nil || !strings.Contains(err.Error(), "ロックファイル作成エラー") {
+		t.Fatalf("err = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("作業ディレクトリが無いのに %v 待った", elapsed)
+	}
+}
+
+// ENOENT 以外の失敗（ここではロックファイルの場所にディレクトリがある）は、待たずにすぐ失敗すること。
+func TestAcquireChunkLockFailsFastOnOtherOpenErrors(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.CreateWorkingDirectory("s1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.root.Mkdir(filepath.Join("s1", "chunk_0.lock"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err := store.AcquireChunkLock("s1", 0, 5*time.Second)
+
+	if err == nil || !strings.Contains(err.Error(), "ロックファイル作成エラー") {
+		t.Fatalf("err = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("開けない理由が ENOENT でないのに %v 待った", elapsed)
 	}
 }
