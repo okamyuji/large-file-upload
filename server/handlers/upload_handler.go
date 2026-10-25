@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"large-file-upload-server/models"
@@ -33,7 +34,7 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// デバッグログ
-	log.Printf("🔍 [DEBUG] %s %s", r.Method, r.URL.Path)
+	log.Printf("🔍 [DEBUG] %s %s", strconv.Quote(r.Method), strconv.Quote(r.URL.Path))
 
 	// パスに基づいてルーティング
 	path := r.URL.Path
@@ -55,7 +56,7 @@ func (h *UploadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		log.Printf("✅ [ROUTE] deleteSession")
 		h.deleteSession(w, r)
 	default:
-		log.Printf("❌ [ROUTE] NOT_FOUND - path: %s, method: %s", path, r.Method)
+		log.Printf("❌ [ROUTE] NOT_FOUND - path: %s, method: %s", strconv.Quote(path), strconv.Quote(r.Method))
 		utils.WriteErrorResponse(w, http.StatusNotFound, "NOT_FOUND", "エンドポイントが見つかりません")
 	}
 }
@@ -154,7 +155,7 @@ func (h *UploadHandler) uploadChunk(w http.ResponseWriter, r *http.Request) {
 			utils.WriteErrorResponse(w, http.StatusNotFound, "SESSION_NOT_FOUND", "セッションが見つかりません", err.Error())
 		} else if strings.Contains(err.Error(), "既にアップロード済み") {
 			// 409の代わりに200で成功として扱う（冪等性の確保）
-			log.Printf("ℹ️ [HANDLER] チャンク %d は既にアップロード済み、成功として処理 (session: %s)", chunkIndex, sessionID)
+			log.Printf("ℹ️ [HANDLER] チャンク %s は既にアップロード済み、成功として処理 (session: %s)", strconv.Itoa(chunkIndex), strconv.Quote(sessionID))
 			response := models.ChunkUploadResponse{
 				ChunkIndex: chunkIndex,
 				Status:     "already_uploaded",
@@ -220,12 +221,12 @@ func (h *UploadHandler) completeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("🏁 [COMPLETE] Starting completion for sessionId: %s", sessionID)
+	log.Printf("🏁 [COMPLETE] Starting completion for sessionId: %s", strconv.Quote(sessionID))
 
 	// アップロード完了処理
 	result, err := h.uploadService.CompleteUpload(sessionID)
 	if err != nil {
-		log.Printf("❌ [COMPLETE] Error: %v", err)
+		log.Printf("❌ [COMPLETE] Error: %s", strconv.Quote(err.Error()))
 		if strings.Contains(err.Error(), "セッションが見つかりません") {
 			utils.WriteErrorResponse(w, http.StatusNotFound, "SESSION_NOT_FOUND", "セッションが見つかりません", err.Error())
 		} else if strings.Contains(err.Error(), "未完了") {
@@ -238,7 +239,7 @@ func (h *UploadHandler) completeUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("✅ [COMPLETE] Success: %s", result.FilePath)
+	log.Printf("✅ [COMPLETE] Success: %s", strconv.Quote(result.FilePath))
 	utils.WriteJSONResponse(w, http.StatusOK, result)
 }
 

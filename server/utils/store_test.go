@@ -1,0 +1,547 @@
+package utils
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"large-file-upload-server/models"
+)
+
+// newTestStore parent/uploads を Root として開く。parent 側に置いたファイルで「外へ出られない」ことを確かめる。
+func newTestStore(t *testing.T) (*Store, string) {
+	t.Helper()
+
+	parent := t.TempDir()
+	uploads := filepath.Join(parent, "uploads")
+	if err := os.Mkdir(uploads, 0o750); err != nil {
+		t.Fatalf("uploads作成に失敗: %v", err)
+	}
+	root, err := os.OpenRoot(uploads)
+	if err != nil {
+		t.Fatalf("Root を開けません: %v", err)
+	}
+	t.Cleanup(func() { _ = root.Close() })
+
+	return NewStore(root), parent
+}
+
+func assertNotExist(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("%s が存在します (err=%v)", path, err)
+	}
+}
+
+// 検証関数を通さず Root 相対の関数を直接呼んでも、uploads の外には何も作れない。
+func TestStoreRejectsEscapeEvenWhenValidationIsBypassed(t *testing.T) {
+	store, parent := newTestStore(t)
+
+	secret := filepath.Join(parent, "secret.txt")
+	if err := os.WriteFile(secret, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("atomicWrite は ../x を作らない", func(t *testing.T) {
+		if err := store.atomicWrite("../x", []byte("data")); err == nil {
+			t.Fatal("エラーを期待したが nil")
+		}
+		assertNotExist(t, filepath.Join(parent, "x"))
+	})
+
+	t.Run("combine は ../x を作らない", func(t *testing.T) {
+		if err := store.combine("../x", nil); err == nil {
+			t.Fatal("エラーを期待したが nil")
+		}
+		assertNotExist(t, filepath.Join(parent, "x"))
+	})
+
+	t.Run("combine は外のファイルをチャンクとして読まない", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(store.rootDirForTest(t), "ok"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.combine("final", []string{"../secret.txt"}); err == nil {
+			t.Fatal("エラーを期待したが nil")
+		}
+		assertNotExist(t, filepath.Join(store.rootDirForTest(t), "final"))
+	})
+
+	t.Run("acquireLock は ../x.lock を作らない", func(t *testing.T) {
+		if _, err := store.acquireLock("../x.lock", time.Second); err == nil {
+			t.Fatal("エラーを期待したが nil")
+		}
+		assertNotExist(t, filepath.Join(parent, "x.lock"))
+	})
+
+	t.Run("checksum は外のファイルを読まない", func(t *testing.T) {
+		if _, err := store.checksum("../secret.txt"); err == nil {
+			t.Fatal("エラーを期待したが nil")
+		}
+	})
+
+	t.Run("loadManifest は外のディレクトリを読まない", func(t *testing.T) {
+		if got := store.loadManifest(".."); got != nil {
+			t.Fatalf("nil を期待したが %v", got)
+		}
+	})
+
+	t.Run("記録済みパスの変換は uploads 外を拒否する", func(t *testing.T) {
+		for _, p := range []string{"uploads/../x", "../x", "/etc/passwd", "other/x", "uploads/../../x"} {
+			if _, err := store.rel(p); err == nil {
+				t.Errorf("rel(%q) がエラーを返さない", p)
+			}
+		}
+		if err := store.AtomicWriteFile("uploads/../x", []byte("d")); err == nil {
+			t.Error("AtomicWriteFile が uploads 外を拒否しない")
+		}
+		assertNotExist(t, filepath.Join(parent, "x"))
+	})
+
+	t.Run("CleanupWorkingDirectory は uploads 自体を消さない", func(t *testing.T) {
+		for _, p := range []string{"", ".", "/", "uploads", "uploads/", "../uploads"} {
+			if err := store.CleanupWorkingDirectory(p); err == nil {
+				t.Errorf("CleanupWorkingDirectory(%q) がエラーを返さない", p)
+			}
+		}
+	})
+}
+
+func TestStoreRejectsSymlinkEscape(t *testing.T) {
+	store, parent := newTestStore(t)
+	outside := filepath.Join(parent, "outside")
+	if err := os.Mkdir(outside, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(store.rootDirForTest(t), "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.atomicWrite("link/x", []byte("data")); err == nil {
+		t.Fatal("シンボリックリンク経由の書き込みが成功した")
+	}
+	entries, _ := os.ReadDir(outside)
+	if len(entries) != 0 {
+		t.Fatalf("uploads の外にファイルができた: %v", entries)
+	}
+}
+
+func TestStoreCreatesFilesWithRestrictedModes(t *testing.T) {
+	// umask の影響を除いて、コードが指定した権限そのものを確かめる
+	old := syscall.Umask(0)
+	t.Cleanup(func() { syscall.Umask(old) })
+
+	store, _ := newTestStore(t)
+	base := store.rootDirForTest(t)
+
+	workingDir, err := store.CreateWorkingDirectory("session_1_abc")
+	if err != nil {
+		t.Fatalf("CreateWorkingDirectory: %v", err)
+	}
+	if workingDir != filepath.Join("uploads", "session_1_abc") {
+		t.Fatalf("workingDir = %q", workingDir)
+	}
+	assertMode(t, filepath.Join(base, "session_1_abc"), 0o750)
+
+	lock, err := store.AcquireChunkLock("session_1_abc", 0, time.Second)
+	if err != nil {
+		t.Fatalf("AcquireChunkLock: %v", err)
+	}
+	assertMode(t, filepath.Join(base, "session_1_abc", "chunk_0.lock"), 0o600)
+	if err := lock.Release(); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+	assertNotExist(t, filepath.Join(base, "session_1_abc", "chunk_0.lock"))
+
+	chunkPath := filepath.Join(workingDir, "chunk_0.dat")
+	if err := store.AtomicChunkWrite(chunkPath, []byte("abc")); err != nil {
+		t.Fatalf("AtomicChunkWrite: %v", err)
+	}
+	assertMode(t, filepath.Join(base, "session_1_abc", "chunk_0.dat"), 0o600)
+
+	session := &models.UploadSession{
+		ID: "session_1_abc", FileName: "out.bin", WorkingDir: workingDir, TotalChunks: 1,
+		UploadedChunks: map[int]models.ChunkInfo{0: {FilePath: chunkPath}},
+	}
+	final, err := store.CombineChunks(session)
+	if err != nil {
+		t.Fatalf("CombineChunks: %v", err)
+	}
+	assertMode(t, filepath.Join(base, "session_1_abc", "out.bin"), 0o600)
+	sum, err := store.CalculateFileChecksum(final)
+	if err != nil || sum != CalculateChecksum([]byte("abc")) {
+		t.Fatalf("checksum = %q, err = %v", sum, err)
+	}
+
+	if err := store.SaveSessionManifest(session); err != nil {
+		t.Fatalf("SaveSessionManifest: %v", err)
+	}
+	assertMode(t, filepath.Join(base, "session_1_abc", "session.json"), 0o600)
+}
+
+func assertMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("%s の権限 = %#o, 期待値 %#o", path, got, want)
+	}
+}
+
+func TestStoreLifecycle(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	if _, err := store.CreateWorkingDirectory("../etc"); err == nil {
+		t.Fatal("不正なセッションIDを拒否しなかった")
+	}
+
+	workingDir, err := store.CreateWorkingDirectory("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exists, err := store.CheckChunkExists("s1", 0)
+	if err != nil || exists {
+		t.Fatalf("exists=%v err=%v", exists, err)
+	}
+	if err := store.AtomicWriteFile(filepath.Join(workingDir, "chunk_0.dat"), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if exists, _ = store.CheckChunkExists("s1", 0); !exists {
+		t.Fatal("書き込み後にチャンクが存在しない")
+	}
+	if _, err := store.CheckChunkExists("../s1", 0); err == nil {
+		t.Fatal("不正なセッションIDを拒否しなかった")
+	}
+
+	// 書きかけの一時ファイルだけが消える
+	stale := filepath.Join(workingDir, "chunk_1.dat.tmp.deadbeef")
+	if err := store.AtomicWriteFile(filepath.Join(workingDir, "keep.dat"), []byte("k")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AtomicWriteFile(stale, []byte("t")); err != nil {
+		t.Fatal(err)
+	}
+	store.CleanupStaleTempFiles(workingDir, "keep.dat")
+	if _, err := store.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("一時ファイルが残っている: %v", err)
+	}
+	if _, err := store.Stat(filepath.Join(workingDir, "keep.dat")); err != nil {
+		t.Fatalf("通常ファイルが消えた: %v", err)
+	}
+	// 名前に ".tmp." や ".combining." を含む完成ファイルは、一時ファイルではないので残す
+	for _, name := range []string{"backup.tmp.zip", "x.combining.tar", "a.dat.tmp.deadbee", "a.dat.tmp.DEADBEEF"} {
+		if err := store.AtomicWriteFile(filepath.Join(workingDir, name), []byte("f")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.CleanupStaleTempFiles(workingDir, "keep.dat")
+	for _, name := range []string{"backup.tmp.zip", "x.combining.tar", "a.dat.tmp.deadbee", "a.dat.tmp.DEADBEEF"} {
+		if _, err := store.Stat(filepath.Join(workingDir, name)); err != nil {
+			t.Fatalf("一時ファイルでない %s が消えた: %v", name, err)
+		}
+	}
+	// 完成ファイルの名前が一時ファイルの接尾辞と同じ形でも、そのセッションの完成ファイルは残す
+	final := filepath.Join(workingDir, "backup.tmp.deadbeef")
+	staleNext := filepath.Join(workingDir, "chunk_2.dat.tmp.cafebabe")
+	for _, f := range []string{final, staleNext} {
+		if err := store.AtomicWriteFile(f, []byte("f")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.CleanupStaleTempFiles(workingDir, "backup.tmp.deadbeef")
+	if _, err := store.Stat(final); err != nil {
+		t.Fatalf("完成ファイルが消えた: %v", err)
+	}
+	if _, err := store.Stat(staleNext); !os.IsNotExist(err) {
+		t.Fatalf("一時ファイルが残っている: %v", err)
+	}
+
+	// マニフェストの往復。ID がディレクトリ名と食い違うものは読み込まない
+	good := &models.UploadSession{ID: "s1", FileName: "a.bin"}
+	if err := store.SaveSessionManifest(good); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateWorkingDirectory("s2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AtomicWriteFile("uploads/s2/session.json", []byte(`{"id":"other"}`)); err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := store.LoadPersistedSessions()
+	if err != nil || len(sessions) != 1 || sessions[0].ID != "s1" || sessions[0].UploadedChunks == nil {
+		t.Fatalf("sessions=%v err=%v", sessions, err)
+	}
+
+	if err := store.Remove(filepath.Join(workingDir, "keep.dat")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CleanupWorkingDirectory(workingDir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Stat(workingDir); !os.IsNotExist(err) {
+		t.Fatalf("作業ディレクトリが残っている: %v", err)
+	}
+}
+
+func TestCombineChunksReportsMissingChunk(t *testing.T) {
+	store, _ := newTestStore(t)
+	workingDir, _ := store.CreateWorkingDirectory("s1")
+	session := &models.UploadSession{
+		FileName: "a.bin", WorkingDir: workingDir, TotalChunks: 2,
+		UploadedChunks: map[int]models.ChunkInfo{},
+	}
+	if _, err := store.CombineChunks(session); err == nil || !strings.Contains(err.Error(), "チャンク 0") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// rootDirForTest Root の実パスを返す。
+func (s *Store) rootDirForTest(t *testing.T) string {
+	t.Helper()
+	return s.root.Name()
+}
+
+func TestOpenStoreCreatesUploadsDirectory(t *testing.T) {
+	old := syscall.Umask(0)
+	t.Cleanup(func() { syscall.Umask(old) })
+	t.Chdir(t.TempDir())
+
+	store, err := OpenStore()
+	if err != nil {
+		t.Fatalf("OpenStore: %v", err)
+	}
+	assertMode(t, "uploads", 0o750)
+
+	sessions, err := store.LoadPersistedSessions()
+	if err != nil || len(sessions) != 0 {
+		t.Fatalf("sessions=%v err=%v", sessions, err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestStoreRejectsOutsidePathsForStatRemoveChecksum(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.Stat("../x"); err == nil {
+		t.Error("Stat が uploads 外を拒否しない")
+	}
+	if err := store.Remove("../x"); err == nil {
+		t.Error("Remove が uploads 外を拒否しない")
+	}
+	if _, err := store.CalculateFileChecksum("../x"); err == nil {
+		t.Error("CalculateFileChecksum が uploads 外を拒否しない")
+	}
+	if _, err := store.AcquireChunkLock("../x", 0, time.Second); err == nil {
+		t.Error("AcquireChunkLock が不正なIDを拒否しない")
+	}
+	if err := store.SaveSessionManifest(&models.UploadSession{ID: "../x"}); err == nil {
+		t.Error("SaveSessionManifest が不正なIDを拒否しない")
+	}
+	if _, err := store.CalculateFileChecksum("uploads/missing"); err == nil {
+		t.Error("存在しないファイルでエラーにならない")
+	}
+}
+
+func TestAcquireChunkLockTimesOutWhileHeld(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.CreateWorkingDirectory("s1"); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := store.AcquireChunkLock("s1", 0, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AcquireChunkLock("s1", 0, 100*time.Millisecond); err == nil {
+		t.Fatal("保持中のロックが取得できてしまった")
+	}
+	if err := first.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := (&ChunkLock{}).Release(); err != nil {
+		t.Fatalf("空のロックの Release: %v", err)
+	}
+}
+
+func TestAtomicWriteFileFailsWithoutParentDirectory(t *testing.T) {
+	store, _ := newTestStore(t)
+	if err := store.AtomicWriteFile("uploads/nodir/x", []byte("d")); err == nil {
+		t.Fatal("親ディレクトリが無いのに成功した")
+	}
+	if err := store.CleanupWorkingDirectory("uploads/never-created"); err != nil {
+		t.Fatalf("存在しないディレクトリの削除はエラーにしない: %v", err)
+	}
+	if err := store.combine("nodir/final", nil); err == nil {
+		t.Fatal("親ディレクトリが無いのに成功した")
+	}
+}
+
+// 解放と同時に待っていた要求と新しく来た要求が、別々のロックファイルを掴んで
+// 同時にロックを持つことがないこと。旧実装は解放してからロックファイルを消していたので、
+// 待っていた側は消えたファイルのロックを、新しい側は作り直したファイルのロックを取れた。
+func TestChunkLockHasOneHolderWhenReleasedWhileOthersWait(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.CreateWorkingDirectory("s1"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.AcquireChunkLock("s1", 0, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		lock *ChunkLock
+		err  error
+	}
+	acquired := make(chan result, 2)
+	acquire := func() {
+		lock, err := store.AcquireChunkLock("s1", 0, 300*time.Millisecond)
+		acquired <- result{lock, err}
+	}
+	go acquire()
+	time.Sleep(20 * time.Millisecond) // 待つ側が古いロックファイルを開いて待っている状態にする
+
+	if err := first.Release(); err != nil {
+		t.Fatal(err)
+	}
+	go acquire()
+
+	var holders []*ChunkLock
+	for range 2 {
+		r := <-acquired
+		if r.err == nil {
+			holders = append(holders, r.lock)
+		}
+	}
+	for _, h := range holders {
+		_ = h.Release()
+	}
+	if len(holders) != 1 {
+		t.Fatalf("同時にロックを持った要求の数 = %d、1 であるべき", len(holders))
+	}
+}
+
+// 解放は、ロックを外す前にロックファイルを消すこと。消す前に外すと、その隙間に
+// ロックを取った待ち手には、まだ同じ場所にあるファイルに見えて持ち主が2つになる。
+// 隙間は数マイクロ秒なので、待ち手が休まずに試し続ける形で何度も繰り返して捉える。
+func TestChunkLockReleaseUnlinksBeforeUnlocking(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.CreateWorkingDirectory("s1"); err != nil {
+		t.Fatal(err)
+	}
+	lockRel := filepath.Join("s1", "chunk_0.lock")
+
+	for i := range 200 {
+		holder, err := store.AcquireChunkLock("s1", 0, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		waiter, err := store.root.OpenFile(lockRel, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		spinning := make(chan struct{})
+		linkedAtLock := make(chan bool, 1)
+		go func() {
+			signaled := false
+			for {
+				if syscall.Flock(int(waiter.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+					linkedAtLock <- store.isLinked(waiter, lockRel)
+					return
+				}
+				if !signaled {
+					close(spinning)
+					signaled = true
+				}
+			}
+		}()
+		<-spinning
+
+		if err := holder.Release(); err != nil {
+			t.Fatal(err)
+		}
+		linked := <-linkedAtLock
+		_ = waiter.Close()
+		if linked {
+			t.Fatalf("試行 %d: ロックを外した時点でロックファイルがまだ残っていた", i)
+		}
+	}
+}
+
+// 同じロックへの取得と解放が多数重なっても、期限内なら取得は失敗しないこと。
+// 解放がロックファイルを消した直後に開くと、作り直す前で ENOENT になることがある。
+func TestChunkLockSurvivesHeavyContention(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.CreateWorkingDirectory("s1"); err != nil {
+		t.Fatal(err)
+	}
+	const workers, rounds = 16, 30
+	errs := make(chan error, workers*rounds)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Go(func() {
+			for range rounds {
+				lock, err := store.AcquireChunkLock("s1", 0, 10*time.Second)
+				if err != nil {
+					errs <- err
+					continue
+				}
+				if err := lock.Release(); err != nil {
+					errs <- err
+				}
+			}
+		})
+	}
+	wg.Wait()
+	close(errs)
+	var failures []string
+	for err := range errs {
+		failures = append(failures, err.Error())
+	}
+	if len(failures) > 0 {
+		t.Fatalf("%d 件失敗した。最初: %s", len(failures), failures[0])
+	}
+}
+
+// 作業ディレクトリが無いときは、ロックの期限まで待たずにすぐ失敗すること。
+func TestAcquireChunkLockFailsFastWithoutWorkingDirectory(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	start := time.Now()
+	_, err := store.AcquireChunkLock("missing", 0, 5*time.Second)
+
+	if err == nil || !strings.Contains(err.Error(), "ロックファイル作成エラー") {
+		t.Fatalf("err = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("作業ディレクトリが無いのに %v 待った", elapsed)
+	}
+}
+
+// ENOENT 以外の失敗（ここではロックファイルの場所にディレクトリがある）は、待たずにすぐ失敗すること。
+func TestAcquireChunkLockFailsFastOnOtherOpenErrors(t *testing.T) {
+	store, _ := newTestStore(t)
+	if _, err := store.CreateWorkingDirectory("s1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.root.Mkdir(filepath.Join("s1", "chunk_0.lock"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	_, err := store.AcquireChunkLock("s1", 0, 5*time.Second)
+
+	if err == nil || !strings.Contains(err.Error(), "ロックファイル作成エラー") {
+		t.Fatalf("err = %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("開けない理由が ENOENT でないのに %v 待った", elapsed)
+	}
+}

@@ -29,6 +29,24 @@ func useTempUploadsDir(t *testing.T) string {
 	return tempDir
 }
 
+func newTestService(t *testing.T) *UploadService {
+	t.Helper()
+	service, err := NewUploadService()
+	if err != nil {
+		t.Fatalf("サービス作成に失敗: %v", err)
+	}
+	return service
+}
+
+func newTestServiceWithRetention(t *testing.T, incomplete, completed time.Duration) *UploadService {
+	t.Helper()
+	service, err := NewUploadServiceWithRetention(incomplete, completed)
+	if err != nil {
+		t.Fatalf("サービス作成に失敗: %v", err)
+	}
+	return service
+}
+
 // uploadAllChunks テスト用にファイル全体を chunkSize で分割して送り込む。
 func uploadAllChunks(t *testing.T, service *UploadService, sessionID string, data []byte, chunkSize int) {
 	t.Helper()
@@ -89,7 +107,7 @@ func newTestSession(t *testing.T, service *UploadService, data []byte, chunkSize
 func TestUploadChunkTriggersCombineWithoutCompleteCall(t *testing.T) {
 	useTempUploadsDir(t)
 
-	service := NewUploadService()
+	service := newTestService(t)
 	data := []byte(strings.Repeat("最終チャンク到達で自動結合されることを確認するテストデータ\n", 100))
 	chunkSize := 1024
 
@@ -105,7 +123,7 @@ func TestUploadChunkTriggersCombineWithoutCompleteCall(t *testing.T) {
 	if !exists {
 		t.Fatal("完了後にセッションが消えています")
 	}
-	finalChecksum, err := utils.CalculateFileChecksum(stored.FinalFilePath)
+	finalChecksum, err := service.store.CalculateFileChecksum(stored.FinalFilePath)
 	if err != nil {
 		t.Fatalf("最終ファイルのチェックサム計算に失敗: %v", err)
 	}
@@ -118,7 +136,7 @@ func TestUploadChunkTriggersCombineWithoutCompleteCall(t *testing.T) {
 func TestCompleteUploadIsIdempotent(t *testing.T) {
 	useTempUploadsDir(t)
 
-	service := NewUploadService()
+	service := newTestService(t)
 	data := []byte(strings.Repeat("冪等性の確認用データ。complete を二度呼んでも結果は変わらない\n", 100))
 	chunkSize := 1024
 
@@ -152,7 +170,7 @@ func TestSessionsSurviveServiceRestart(t *testing.T) {
 	chunkSize := 1024
 	totalChunks := (len(data) + chunkSize - 1) / chunkSize
 
-	service := NewUploadService()
+	service := newTestService(t)
 	session := newTestSession(t, service, data, chunkSize)
 
 	// 先頭2チャンクだけ送って中断した状態を作る
@@ -164,7 +182,7 @@ func TestSessionsSurviveServiceRestart(t *testing.T) {
 	}
 
 	// プロセス再起動に相当する。新しいインスタンスがディスクから復元する。
-	restarted := NewUploadService()
+	restarted := newTestService(t)
 	status, err := restarted.GetSessionStatus(session.ID)
 	if err != nil {
 		t.Fatalf("再起動後のステータス取得に失敗: %v", err)
@@ -196,7 +214,7 @@ func TestSessionsSurviveServiceRestart(t *testing.T) {
 func TestConcurrentChunksDoNotClobberCompletedManifest(t *testing.T) {
 	useTempUploadsDir(t)
 
-	service := NewUploadService()
+	service := newTestService(t)
 	data := []byte(strings.Repeat("並行送信でマニフェストが巻き戻らないことを確認するデータ\n", 400))
 	chunkSize := 1024
 	totalChunks := (len(data) + chunkSize - 1) / chunkSize
@@ -224,7 +242,7 @@ func TestConcurrentChunksDoNotClobberCompletedManifest(t *testing.T) {
 	waitForStatus(t, service, session.ID, models.StatusCompleted)
 
 	// 再起動しても完了のまま復元されること
-	restarted := NewUploadService()
+	restarted := newTestService(t)
 	status, err := restarted.GetSessionStatus(session.ID)
 	if err != nil {
 		t.Fatalf("再起動後のステータス取得に失敗: %v", err)
@@ -240,7 +258,7 @@ func TestCleanupUsesSeparateRetentionForCompletedSessions(t *testing.T) {
 	useTempUploadsDir(t)
 
 	// 未完了は1ナノ秒で期限切れ、完了済みは十分長く保持する設定にする
-	service := NewUploadServiceWithRetention(time.Nanosecond, time.Hour)
+	service := newTestServiceWithRetention(t, time.Nanosecond, time.Hour)
 
 	data := []byte(strings.Repeat("保持期間の分離を検証するためのテストデータです\n", 100))
 	chunkSize := 1024
@@ -277,7 +295,7 @@ func TestCleanupUsesSeparateRetentionForCompletedSessions(t *testing.T) {
 func TestStatusReportsExpiry(t *testing.T) {
 	useTempUploadsDir(t)
 
-	service := NewUploadServiceWithRetention(2*time.Hour, 48*time.Hour)
+	service := newTestServiceWithRetention(t, 2*time.Hour, 48*time.Hour)
 	data := []byte(strings.Repeat("再開可能期限の提示を検証するデータ\n", 100))
 	chunkSize := 1024
 
@@ -300,7 +318,7 @@ func TestStatusReportsExpiry(t *testing.T) {
 func TestDuplicateChunkWithDifferentContentIsReplaced(t *testing.T) {
 	useTempUploadsDir(t)
 
-	service := NewUploadService()
+	service := newTestService(t)
 	data := []byte(strings.Repeat("再送で中身が置き換わることを確認するためのテストデータ\n", 100))
 	chunkSize := 1024
 	totalChunks := (len(data) + chunkSize - 1) / chunkSize
@@ -337,7 +355,7 @@ func TestDuplicateChunkWithDifferentContentIsReplaced(t *testing.T) {
 func TestDuplicateChunkWithSameContentIsTreatedAsUploaded(t *testing.T) {
 	useTempUploadsDir(t)
 
-	service := NewUploadService()
+	service := newTestService(t)
 	data := []byte(strings.Repeat("同一内容の再送が冪等であることを確認するデータ\n", 100))
 	chunkSize := 1024
 
@@ -360,7 +378,7 @@ func TestDuplicateChunkWithSameContentIsTreatedAsUploaded(t *testing.T) {
 func TestRestoreMarksErrorWhenFinalFileIsMissing(t *testing.T) {
 	useTempUploadsDir(t)
 
-	service := NewUploadService()
+	service := newTestService(t)
 	data := []byte(strings.Repeat("最終ファイルの実在確認を検証するためのテストデータ\n", 100))
 	chunkSize := 1024
 
@@ -373,7 +391,7 @@ func TestRestoreMarksErrorWhenFinalFileIsMissing(t *testing.T) {
 		t.Fatalf("最終ファイル削除に失敗: %v", err)
 	}
 
-	restarted := NewUploadService()
+	restarted := newTestService(t)
 	status, err := restarted.GetSessionStatus(session.ID)
 	if err != nil {
 		t.Fatalf("再起動後のステータス取得に失敗: %v", err)
@@ -391,7 +409,7 @@ func TestRestoreDropsChunksWithoutFiles(t *testing.T) {
 	data := []byte(strings.Repeat("実体が消えたチャンクを未受信に戻すことを確認するデータ\n", 100))
 	chunkSize := 1024
 
-	service := NewUploadService()
+	service := newTestService(t)
 	session := newTestSession(t, service, data, chunkSize)
 
 	chunk := data[0:chunkSize]
@@ -405,12 +423,40 @@ func TestRestoreDropsChunksWithoutFiles(t *testing.T) {
 		t.Fatalf("チャンクファイル削除に失敗: %v", err)
 	}
 
-	restarted := NewUploadService()
+	restarted := newTestService(t)
 	status, err := restarted.GetSessionStatus(session.ID)
 	if err != nil {
 		t.Fatalf("再起動後のステータス取得に失敗: %v", err)
 	}
 	if status.UploadedChunks != 0 {
 		t.Fatalf("実体の無いチャンクが受信済みのまま残っています: %d", status.UploadedChunks)
+	}
+}
+
+// 完成ファイルの名前が一時ファイルの接尾辞と同じ形でも、再起動時の掃除で消さないこと。
+func TestRestoreKeepsFinalFileNamedLikeTempFile(t *testing.T) {
+	useTempUploadsDir(t)
+
+	service := newTestService(t)
+	data := []byte(strings.Repeat("一時ファイルと同じ形の名前の完成ファイルを残すことを確認するデータ\n", 100))
+	chunkSize := 1024
+	session, err := service.CreateSession(&models.CreateSessionRequest{
+		FileName:     "backup.tmp.deadbeef",
+		TotalChunks:  (len(data) + chunkSize - 1) / chunkSize,
+		FileSize:     int64(len(data)),
+		FileChecksum: utils.CalculateChecksum(data),
+		ChunkSize:    chunkSize,
+	})
+	if err != nil {
+		t.Fatalf("セッション作成に失敗: %v", err)
+	}
+	uploadAllChunks(t, service, session.ID, data, chunkSize)
+	waitForStatus(t, service, session.ID, models.StatusCompleted)
+
+	stored, _ := service.GetSession(session.ID)
+	newTestService(t) // 再起動。復元のときに書きかけの一時ファイルを掃除する
+
+	if _, err := os.Stat(stored.FinalFilePath); err != nil {
+		t.Fatalf("再起動時の掃除で完成ファイルが消えた: %v", err)
 	}
 }
