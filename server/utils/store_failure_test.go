@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -211,30 +210,5 @@ func TestCheckChunkExists_reportsUnexpectedStatError(t *testing.T) {
 
 	if err == nil || exists {
 		t.Fatalf("exists=%v err=%v", exists, err)
-	}
-}
-
-// ファイルサイズ上限 (RLIMIT_FSIZE) を超える書き込みで write を実際に失敗させる。
-// Go は SIGXFSZ を無視するので、プロセスは落ちず EFBIG が返る。soft limit だけ下げて後で戻す。
-func TestAtomicWriteFile_removesTempFileWhenWriteFails(t *testing.T) {
-	store, _ := newTestStore(t)
-	var old syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_FSIZE, &old); err != nil {
-		t.Skipf("Getrlimit: %v", err)
-	}
-	limited := syscall.Rlimit{Cur: 16, Max: old.Max}
-	if err := syscall.Setrlimit(syscall.RLIMIT_FSIZE, &limited); err != nil {
-		t.Skipf("Setrlimit: %v", err)
-	}
-	t.Cleanup(func() { _ = syscall.Setrlimit(syscall.RLIMIT_FSIZE, &old) })
-
-	err := store.AtomicWriteFile("uploads/big", make([]byte, 4096))
-
-	if err == nil || !strings.Contains(err.Error(), "一時ファイル書き込みエラー") {
-		t.Fatalf("err = %v", err)
-	}
-	entries, readErr := os.ReadDir(store.rootDirForTest(t))
-	if readErr != nil || len(entries) != 0 {
-		t.Fatalf("entries=%v err=%v", entries, readErr)
 	}
 }

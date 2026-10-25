@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -383,6 +384,10 @@ func (s *Store) readDir(rel string) ([]fs.DirEntry, error) {
 // 結合中や原子的書き込みの最中にプロセスが落ちると、`.combining.*` や `.tmp.*` が残る。
 // 結合の一時ファイルは最終ファイルと同じ大きさになり得るので、再起動のたびに積み上がると
 // 作業領域を使い切り、既存セッションの結合も新規チャンクの受信も失敗するようになる。
+// staleTempPattern combine と atomicWrite が付ける接尾辞だけに一致させる。
+// ".tmp." を含むだけの名前（backup.tmp.zip など）は利用者の完成ファイルなので消さない。
+var staleTempPattern = regexp.MustCompile(`\.(combining|tmp)\.[0-9a-f]{8}$`)
+
 func (s *Store) CleanupStaleTempFiles(workingDir string) {
 	dirRel, err := s.rel(workingDir)
 	if err != nil {
@@ -395,7 +400,7 @@ func (s *Store) CleanupStaleTempFiles(workingDir string) {
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.Contains(name, ".combining.") && !strings.Contains(name, ".tmp.") {
+		if !staleTempPattern.MatchString(name) {
 			continue
 		}
 		if removeErr := s.root.Remove(filepath.Join(dirRel, name)); removeErr == nil {

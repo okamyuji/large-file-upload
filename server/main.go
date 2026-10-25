@@ -117,8 +117,8 @@ func main() {
 	// PORT は環境変数由来。strconv.Quote で制御文字をエスケープし、ログ行の偽造を防ぐ(gosec G706 が認識する無害化関数でもある)
 	safePort := strconv.Quote(port)
 	log.Printf("サーバーを開始します（ポート: %s）", safePort)
-	log.Printf("API仕様書: http://localhost:%s/", safePort)
-	log.Printf("ヘルスチェック: http://localhost:%s/health", safePort)
+	log.Printf("API仕様書: %s", strconv.Quote("http://localhost:"+port+"/"))
+	log.Printf("ヘルスチェック: %s", strconv.Quote("http://localhost:"+port+"/health"))
 
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("サーバー開始エラー: %v", err)

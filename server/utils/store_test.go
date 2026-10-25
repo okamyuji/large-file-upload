@@ -233,6 +233,18 @@ func TestStoreLifecycle(t *testing.T) {
 	if _, err := store.Stat(filepath.Join(workingDir, "keep.dat")); err != nil {
 		t.Fatalf("通常ファイルが消えた: %v", err)
 	}
+	// 名前に ".tmp." や ".combining." を含む完成ファイルは、一時ファイルではないので残す
+	for _, name := range []string{"backup.tmp.zip", "x.combining.tar", "a.dat.tmp.deadbee", "a.dat.tmp.DEADBEEF"} {
+		if err := store.AtomicWriteFile(filepath.Join(workingDir, name), []byte("f")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.CleanupStaleTempFiles(workingDir)
+	for _, name := range []string{"backup.tmp.zip", "x.combining.tar", "a.dat.tmp.deadbee", "a.dat.tmp.DEADBEEF"} {
+		if _, err := store.Stat(filepath.Join(workingDir, name)); err != nil {
+			t.Fatalf("一時ファイルでない %s が消えた: %v", name, err)
+		}
+	}
 
 	// マニフェストの往復。ID がディレクトリ名と食い違うものは読み込まない
 	good := &models.UploadSession{ID: "s1", FileName: "a.bin"}
